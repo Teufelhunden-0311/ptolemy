@@ -32,11 +32,15 @@ struct Data {
     u32 base;           /* 17800 the framebuffer's address from the engine; 0 until the first switch: geo[0] */
     u32 gamma[256];     /* 17804 output per input level, 0x00RRGGBB (all zero until the first cscSetGamma: linear) */
     u8 gtab[12 + 768];  /* 18828 the same as a GammaTbl (3 channels, 256 entries, 8 bits) for cscGetGamma */
+    u32 nmap;           /* 19608 ranges in map (0 until both properties were read) */
+    u32 logical[16];    /* 19612 AAPL,address: where IONDRVSupport mapped each range of the device */
+    u32 assigned[80];   /* 19676 assigned-addresses: 5 words per range (phys.hi, .mid, .lo, size.hi, .lo) */
+    char prop[20];      /* 19996 a property name, written at run time (no literals) */
 };
 _Static_assert(__builtin_offsetof(struct Data, prepare) == 136 && __builtin_offsetof(struct Data, name) == 144 &&
                __builtin_offsetof(struct Data, hw) == 204 && __builtin_offsetof(struct Data, entry) == 304 &&
                __builtin_offsetof(struct Data, image) == 384 && __builtin_offsetof(struct Data, gamma) == 17804 &&
-               sizeof(struct Data) == 17804 + 1024 + 780, "mkpef.py layout");
+               sizeof(struct Data) == 17804 + 1024 + 780 + 4 + 64 + 320 + 20, "mkpef.py layout");
 
 /* Entry (code offset 0): DoDriverIO(space, id, contents, code, kind) with the data section as sixth argument.
  * call_tv calls a Mac OS TVector: 64-byte frame (24 linkage + 32 parameter area), r2 saved above both. */
@@ -89,14 +93,45 @@ static int mode_size(const struct Data *d, u32 mode, u32 *w, u32 *h)
     return *w <= d->geo[2] && *h <= d->geo[3] && (*w < d->geo[2] || *h < d->geo[3]);
 }
 static u32 bits(u32 depth_mode) { return depth_mode == DEPTH8 ? 8 : depth_mode == DEPTH8 + 1 ? 16 : depth_mode == DEPTH32 ? 32 : 0; }
-/* The firmware's pitch for its own mode, else rows of whole 64-pixel units (the engine programs the same). */
+/* The firmware's pitch for its own mode, else rows of whole 256-byte units, as Tiger's ATI driver lays out the
+ * framebuffer it draws into (16 bits at 1472 wide: 3072 bytes); the engine programs the same. */
 static u32 row_bytes(const struct Data *d, u32 mode, u32 w, u32 b)
 {
-    return mode == BOOT_MODE && b == 32 ? d->geo[1] : (w + 63) / 64 * 64 * (b / 8);
+    return mode == BOOT_MODE && b == 32 ? d->geo[1] : (w * (b / 8) + 255) / 256 * 256;
 }
 static u32 cur_mode(const struct Data *d) { return d->mode ? d->mode : BOOT_MODE; }
 static u32 cur_depth(const struct Data *d) { return d->depth ? d->depth : DEPTH32; }
-static u32 cur_base(const struct Data *d) { return d->base ? d->base : d->geo[0]; }
+/* The framebuffer's address for IOFramebuffer. The firmware ("address") and the engine give physical addresses; Leopard
+ * needs the address the kernel mapped it at (pmap_find_phys of it, a panic when unmapped), which Tiger also takes (it
+ * looks it up among the device's mappings, else uses it as physical). IONDRVSupport publishes AAPL,address, the
+ * logical address of each assigned-addresses range: the physical address is translated through them, or kept when
+ * they are missing. */
+static void name_of(char *p, u32 w0, u32 w1, u32 w2, u32 w3, u32 w4)
+{
+    put((u8 *)p, w0); put((u8 *)p + 4, w1); put((u8 *)p + 8, w2); put((u8 *)p + 12, w3); put((u8 *)p + 16, w4);
+}
+static u32 logical(struct Data *d, u32 phys)
+{
+    u32 i, size, n;
+    if (!d->nmap) {
+        name_of(d->prop, 0x4141504c, 0x2c616464, 0x72657373, 0, 0);                 /* "AAPL,address" */
+        size = sizeof d->logical;
+        if (call_tv(d->get, (u32)d->entry, (u32)d->prop, (u32)d->logical, (u32)&size)) return phys;
+        n = size / 4;
+        name_of(d->prop, 0x61737369, 0x676e6564, 0x2d616464, 0x72657373, 0x65730000);   /* "assigned-addresses" */
+        size = sizeof d->assigned;
+        if (call_tv(d->get, (u32)d->entry, (u32)d->prop, (u32)d->assigned, (u32)&size)) return phys;
+        if (size / 20 < n) n = size / 20;
+        if (n > 16) n = 16;
+        d->nmap = n;
+    }
+    for (i = 0; i < d->nmap; i++) {
+        const u32 *a = d->assigned + 5 * i;
+        if ((a[0] >> 24 & 3) >= 2 && !a[1] && !a[3] && phys - a[2] < a[4]) return d->logical[i] + (phys - a[2]);   /* memory space */
+    }
+    return phys;
+}
+static u32 cur_base(struct Data *d) { return logical(d, d->base ? d->base : d->geo[0]); }
 
 /* cscSetGamma: a GammaTbl (version, type, formula size, channels 1 or 3, entries, bits per entry, then the formula and
  * channel after channel of entries of whole bytes; nil = linear) becomes 256 output levels per channel for the engine,

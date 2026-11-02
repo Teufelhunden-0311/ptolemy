@@ -11,8 +11,8 @@ CFLAGS = ['--target=powerpc-unknown-linux-gnu', '-mcpu=750', '-O2', '-ffreestand
           '-msoft-float', '-mno-altivec', '-fno-pic', '-fno-stack-protector', '-fno-asynchronous-unwind-tables',
           '-fno-unwind-tables', '-Wall', '-Wextra', '-Werror']
 DATE = 0xE706EB80          # 2026-10-28 in Mac OS seconds since 1904 (IONDRV refuses containers before March 2001)
-IMAGE_END = 384 + 64 * 64 * 4 + 8 + 256 * 4 + 4 + 256 * 4 + 780  # struct Data in display.c (cursor, mode, depth,
-#                                                               colour table, base, gamma, GammaTbl)
+IMAGE_END = 384 + 64 * 64 * 4 + 8 + 256 * 4 + 4 + 256 * 4 + 780 + 4 + 64 + 320 + 20  # struct Data in display.c (cursor,
+#                         mode, depth, colour table, base, gamma, GammaTbl, the logical address map, a property name)
 
 
 def code_bytes(tmp):
