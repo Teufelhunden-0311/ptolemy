@@ -85,7 +85,8 @@ static int media_change(const char *path,int slot){
             const char *tmpdir=getenv("TMPDIR");snprintf(m->folder,sizeof m->folder,"%s/ptolemy-zip-XXXXXX",tmpdir&&*tmpdir?tmpdir:"/tmp");
             if(!mkdtemp(m->folder)){e=errno;m->folder[0]=0;}
             else {char files[PATH_MAX+16],image[PATH_MAX+16];snprintf(files,sizeof files,"%s/files",m->folder);snprintf(image,sizeof image,"%s/image.dmg",m->folder);
-                const char *unzip[]={"ditto","-x","-k",path,files,NULL},*make[]={"hdiutil","create","-quiet","-srcfolder",files,"-fs","HFS+","-format","UDRO",image,NULL};
+                char vol[256];const char *b=strrchr(path,'/');snprintf(vol,sizeof vol,"%s",b?b+1:path);char *x=strrchr(vol,'.');if(x&&x!=vol)*x=0;   /* the disk's name: the zip's */
+                const char *unzip[]={"ditto","-x","-k",path,files,NULL},*make[]={"hdiutil","create","-quiet","-srcfolder",files,"-volname",vol,"-fs","HFS+","-format","UDRO",image,NULL};
                 if(!(e=run_tool(unzip,NULL,0))&&!(e=run_tool(make,NULL,0)))snprintf(raw,sizeof raw,"%s",image);}
         }
         if(!e&&slot==1){char out[4096];const char *attach[]={"hdiutil","attach","-nomount","-readonly","-noverify","-noautofsck",raw,NULL};
@@ -185,18 +186,27 @@ static int guest_words(CPU *c,uint32_t a,uint32_t *out,uint32_t n) {   /* n byte
  * refused), 4 = colour table (r4 address of 0x00RRGGBB words, r5 first entry, r6 count) and 5 = output gamma (r4 address
  * of 256 0x00RRGGBB words, the output level of each input level; r6 256). */
 static unsigned gamma_curves;   /* ramps that are not the identity (fades, calibration), reported at exit */
+static uint64_t now_ns(void);
 static int cursor_call(CPU *c,uint32_t instruction){
     if(instruction!=0x00005043u || c->gpr[0]!=0x50544355u) return 0;
     uint32_t op=c->gpr[3],a=c->gpr[4],w=c->gpr[5],h=c->gpr[6],n=w*h*4; static uint32_t image[64*64];
     c->gpr[3]=1;
     if(c->msr&MSR_PR) return 1;
-    if(op==2){ atomic_store(&hw_cursor.pos,(uint64_t)(uint16_t)a|(uint64_t)(uint16_t)w<<16|(uint64_t)(h!=0)<<32); c->gpr[3]=0; return 1; }
+    if(op==2){ atomic_store(&hw_cursor.pos,(uint64_t)(uint16_t)a|(uint64_t)(uint16_t)w<<16|(uint64_t)(h!=0)<<32); c->gpr[3]=0;
+        static int log=-1; static unsigned last=9; if(log<0) log=getenv("PT_CURSOR_LOG")!=NULL;   /* development: the hardware cursor's visibility */
+        if(log && (h!=0)!=last){ last=h!=0; fprintf(stderr,"cursor %.3f s: hardware cursor %s\n",(double)now_ns()/1e9,last?"shown":"hidden"); }
+        return 1; }
     if(op==5){ uint32_t t[256]; if(h==256 && !(a&3) && !guest_words(c,a,t,sizeof t)){ int linear=1; for(uint32_t i=0;i<256;i++) linear&=t[i]==i*0x010101u;
-            pthread_mutex_lock(&hw_cursor.lock); memcpy(hw_cursor.gamma,t,sizeof t); hw_cursor.gamma_on=!linear; hw_cursor.gamma_gen++; pthread_mutex_unlock(&hw_cursor.lock); c->gpr[3]=0; gamma_curves+=!linear; }
+            pthread_mutex_lock(&hw_cursor.lock); memcpy(hw_cursor.gamma,t,sizeof t); hw_cursor.gamma_on=!linear; hw_cursor.gamma_gen++; pthread_mutex_unlock(&hw_cursor.lock); c->gpr[3]=0; gamma_curves+=!linear;
+            if(getenv("PT_PALETTE_LOG")) fprintf(stderr,"gamma %.3f s: %s, 64 %06x 128 %06x 255 %06x\n",(double)now_ns()/1e9,linear?"identity":"curve",t[64],t[128],t[255]); }
         return 1; }
 #ifdef PT_OPTICS
     if(op==3){ uint32_t off; c->gpr[3]=radeon && !pt_radeon_display_mode(radeon,a,w,h,&off) ? bars[2].base+off : 0; return 1; }   /* the framebuffer's address, 0 refused */
-    if(op==4){ uint32_t rgb[256]; if(radeon && w<256 && h && h<=256-w && !(a&3) && !guest_words(c,a,rgb,h*4)) c->gpr[3]=pt_radeon_palette(radeon,w,h,rgb)?1:0; return 1; }
+    if(op==4){ uint32_t rgb[256]; if(radeon && w<256 && h && h<=256-w && !(a&3) && !guest_words(c,a,rgb,h*4)) { c->gpr[3]=pt_radeon_palette(radeon,w,h,rgb)?1:0;
+            static int log=-1; if(log<0) log=getenv("PT_PALETTE_LOG")!=NULL;   /* development: each colour table the display driver sets */
+            if(log){ uint32_t f=2166136261u; for(uint32_t i=0;i<h;i++) f=(f^rgb[i])*16777619u;
+                fprintf(stderr,"palette %.3f s: %u+%u: %06x .. %06x hash %08x\n",(double)now_ns()/1e9,w,h,rgb[0],rgb[h-1],f); } }
+        return 1; }
 #else
     if(op==3){ c->gpr[3]=0; return 1; }
 #endif
@@ -217,7 +227,9 @@ static int private_call(CPU *c,uint32_t instruction){
     unsigned op=c->gpr[3],state=c->gpr[5];
     int r=pt_agent_hypercall(c,instruction,agent);
     if(r && instruction==PTA_INSN && c->gpr[0]==PTA_MAGIC && c->gpr[3]==PTA_OK){
-        if(op==PTA_INPUT)pt_cursor_publish(&pointer_mailbox,state,pt_cursor_now());
+        if(op==PTA_INPUT){ pt_cursor_publish(&pointer_mailbox,state,pt_cursor_now());
+            static int log=-1; static unsigned last=9; if(log<0) log=getenv("PT_CURSOR_LOG")!=NULL;   /* development: CGCursorIsVisible as the agent reports it */
+            if(log && state!=last){ last=state; fprintf(stderr,"cursor %.3f s: the agent reports %s\n",(double)now_ns()/1e9,state==2?"hidden":state==1?"visible":"unknown"); } }
         else if(op==PTA_BYE || op==PTA_HELLO)pt_cursor_publish(&pointer_mailbox,PT_CURSOR_UNKNOWN,pt_cursor_now());
     }
     if(audio_stats>0){uint64_t d=host_ns()-t0;if(d>hyper_max)hyper_max=d;}
@@ -412,7 +424,12 @@ static void radeon_shot(void) {
             fwrite(rgb,1,3,out);
         }
         fclose(out);
-    }pt_radeon_frame_release(radeon,&f);
+    }
+    if(getenv("PT_SHOT_RAW")){   /* development: the scanout's bytes as published, with "w h bpp line big_endian" first */
+        snprintf(name,sizeof name,"%s/shot-%04u.raw",shot_dir,shot_n-1);FILE *raw=fopen(name,"wb");
+        if(raw){fprintf(raw,"%u %u %u %u %d\n",f.width,f.height,f.bpp,f.line,f.big_endian);fwrite(f.pixels,1,(size_t)f.line*f.height,raw);fclose(raw);}
+    }
+    pt_radeon_frame_release(radeon,&f);
 }
 static void shot(void) { if(radeon) radeon_shot(); }   /* PPM snapshot, CPU owner. */
 static void pci_init(void) {

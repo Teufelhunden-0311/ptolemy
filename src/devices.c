@@ -26,6 +26,7 @@ int pt_devices_init(PtDevices *d,PtRam ram,PtBus *bus,PtPic *pic,PtEvent *event,
     pt_ohci_init(&d->usb,ram,&d->hid[0],&d->hid[1],&d->hid[2],nd_devices_usb_irq,d);pt_usb_msc_init(&d->storage);
     unsigned latency=25;const char *text=getenv("PT_PCM_LATENCY_MS");if(text){char *end;unsigned long n=strtoul(text,&end,10);if(*text&&!*end&&n<=1000)latency=(unsigned)n;}
     pt_pcm_init(&d->pcm,latency*PT_PCM_RATE/1000);pt_screamer_init(&d->sound,&d->dma[16],&d->pcm);
+    {const char *dump=getenv("PT_AUDIO_DUMP");if(dump&&*dump)d->sound.dump=fopen(dump,"wb");}   /* tools/audio-dump-check.py */
     for(unsigned k=0;k<2;k++){d->ata_lines[k]=(PtDeviceLine){d,k};pt_ata_init(&d->ata[k],NULL,&d->dma[k?26:22],nd_devices_ata_irq,&d->ata_lines[k]);}
     pt_scsi_init(&d->optical,1);pt_atapi_bind(&d->ata[1],&d->optical);
     if(raw){PtBlock *block=pt_block_open(raw,0,event);if(!block){int e=errno;pt_devices_close(d);return e;}int e=pt_devices_disk(d,block,kick);if(e){pt_block_close(block);pt_devices_close(d);return e;}}
