@@ -136,6 +136,12 @@ typedef struct {
 - (PtR2Program *)preparePVS:(const PtR2ShaderIR *)pvs vertexInterface:(const PtR2ShaderInterface *)vi
     fragment:(const PtR2ShaderIR *)us interface:(const PtR2ShaderInterface *)fi
     route:(PtR2Route)route error:(NSError **)error;
+/* The MSL libraries preparePVS will need, compiled on Metal's threads: YES while one is still compiling (wake runs on
+ * each completion, any thread); NO when all are ready or preparePVS should report the failure. */
+- (BOOL)startLibrariesForPVS:(const PtR2ShaderIR *)pvs vertexInterface:(const PtR2ShaderInterface *)vi
+    fragment:(const PtR2ShaderIR *)us interface:(const PtR2ShaderInterface *)fi route:(PtR2Route)route wake:(void (^)(void))wake;
+- (unsigned)librariesCompiling;   /* any thread */
+- (void)waitForLibraries;          /* until no background compile runs (and calls its wake) */
 - (PtR2Target *)targetWidth:(uint32_t)width height:(uint32_t)height samples:(PtR2MsaaInput)samples error:(NSError **)error;
 /* Immutable RGBA8 level-zero snapshot. Upload bytes are copied, never retained as a guest pointer. */
 - (PtR2Texture *)textureWidth:(uint32_t)width height:(uint32_t)height bytes:(const void *)bytes

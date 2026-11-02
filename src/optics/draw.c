@@ -68,9 +68,10 @@ static void decode_stream(uint32_t t,unsigned method,const uint32_t w[4],float r
     }
 }
 /* Keep conversion in the native Metal vertex fetch for an exact common AoS subset.
- * Unsupported layouts use the normalized decoder; no new guest memory mapping. */
+ * Unsupported layouts use the normalized decoder; no new guest memory mapping. On by default (Halo's time demo: 9% more
+ * frames per second, 63% less draw-build time, the same image); OPTICS_RAW_VERTICES=0 expands every draw to float4. */
 static int raw_snapshot(OpticsDraw *d,const Stream *stream,unsigned ns,const OpticsAos *aos,unsigned swap,OpticsFetch fetch,void *ctx) {
-    static int enabled=-1;if(enabled<0){const char *v=getenv("OPTICS_RAW_VERTICES");enabled=v&&atoi(v)!=0;}
+    static int enabled=-1;if(enabled<0){const char *v=getenv("OPTICS_RAW_VERTICES");enabled=!v||atoi(v)!=0;}
     if(!enabled||!d->vertices||swap==1||swap>=3)return 0;
     if(aos->array[0].stride>64)return 0;
     uint32_t stride=aos->array[0].stride*4,mask=0;uint64_t base=UINT64_MAX;unsigned extent=0;
@@ -96,7 +97,7 @@ static int raw_snapshot(OpticsDraw *d,const Stream *stream,unsigned ns,const Opt
  * Each source is checked and snapshotted before a render worker sees the draw. */
 static int raw_stream_snapshot(OpticsDraw *d,const Stream *stream,unsigned ns,const OpticsAos *aos,
     const uint32_t *immediate,unsigned vsize,unsigned swap,uint32_t normalization,OpticsFetch fetch,void *ctx) {
-    static int enabled=-1;if(enabled<0){const char *a=getenv("OPTICS_RAW_VERTICES"),*b=getenv("OPTICS_RAW_STREAMS");enabled=a&&atoi(a)!=0&&b&&atoi(b)!=0;}
+    static int enabled=-1;if(enabled<0){const char *a=getenv("OPTICS_RAW_VERTICES"),*b=getenv("OPTICS_RAW_STREAMS");enabled=(!a||atoi(a)!=0)&&(!b||atoi(b)!=0);}
     if(!enabled||!d->vertices||swap>3)return 0;
     uint32_t mask=0,packed=0;uint64_t base=UINT64_MAX;unsigned extent=0;
     for(unsigned j=0;j<16;j++){d->raw_attribute[j]=(OpticsRawAttribute){0,4,OPTICS_RAW_DEFAULT};d->raw_select[j]=0;}
@@ -301,9 +302,10 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
         for(unsigned p=0;p<6;p++) if(cc>>p&1){ uint32_t w[4]; if(optics_r300_pvs_vector(st,1024+p,w)!=OPTICS_STATE_OK) return refuse(reason,"user clip plane not loaded");
             for(int c=0;c<4;c++) d->clip_plane[p][c]=f32(w[c]); } } }
     { uint32_t rc=R(0x4e18); if(rc&4) d->rop=(uint8_t)(1+(rc>>8&15)); }
-    /* GA_POLY_MODE (glPolygonMode): both faces as lines draw triangle edges (Metal's line fill mode), both as points draw
-     * the vertices as points (below), faces in different modes go to the frontend as two passes (poly_front/back).
-     * Approximation: edge flags are not modelled (every edge is drawn). */
+    /* GA_POLY_MODE (glPolygonMode): polygons with a face in line mode become lines after the build (polyline below);
+     * indexed ones draw their triangles' edges (Metal's line fill mode); both faces as points draw the vertices as points
+     * (below); faces in different modes go to the frontend as two passes (poly_front/back). Approximation: edge flags in
+     * point mode and in indexed draws are not modelled (every vertex, every triangle edge is drawn). */
     d->poly_front=d->poly_back=2;
     { uint32_t pm=R(0x4288); if(pm&1) { unsigned front=pm>>4&7,back=pm>>7&7;
         if(front>2 || back>2) d->approx|=OPTICS_APPROX_FIXED; else { d->poly_front=(uint8_t)front; d->poly_back=(uint8_t)back; }
@@ -359,7 +361,10 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
      * ADD, ADD_NOCLAMP, SUB, SUB_NOCLAMP, MIN, MAX, RSUB, RSUB_NOCLAMP (an 8-bit target clamps either way). Encoded for the
      * executor in Metal's factor/operation enum order, see draw.h. */
     uint32_t blend=R(RB3D_BLENDCNTL);
-    d->discard=(uint8_t)(blend>>3&7); if(d->discard==7) return refuse(reason,"source pixel discard mode 7");
+    /* DISCARD_SRC_PIXELS 5:3 discards "when blending is enabled" (R3xx register reference): with ALPHA_BLEND_ENABLE off
+     * the field does nothing. Halo's shadow blur draws so (blending off, discard if alpha is 0); discarding there kept
+     * the blurred shadow map's stale background, and the ground under every creature darkened in a square. */
+    d->discard=(uint8_t)(blend&1?blend>>3&7:0); if(d->discard==7) return refuse(reason,"source pixel discard mode 7");
     if(blend&1) {
         static const uint8_t factor[15]={0,1,2,3,6,7,4,5,8,9,10,11,12,13,14},op[8]={0,0,1,1,3,4,2,2};
         uint32_t a=blend>>1&1?R(RB3D_ABLENDCNTL):blend,f[4]={blend>>16&63,blend>>24&63,a>>16&63,a>>24&63};
@@ -458,6 +463,8 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
     for(unsigned s=0;s<ns;s++) free(array[s]);
     }
     if(!d->poly_front && !d->poly_back && (prim==4||prim==5||prim==6||prim==13||prim==14||prim==15)) prim=1;   /* polygons as points */
+    if(!indices && d->poly_front && d->poly_back && (d->poly_front==1 || d->poly_back==1) && (prim==4||prim==5||prim==6||prim==13||prim==14||prim==15)) {
+        d->polyline=1; d->poly_prim=(uint8_t)prim; d->poly_count=count; d->fill=0; }
     /* Lines (2), line strip (3) and line loop (12) as Metal one-pixel lines (Cinebench draws GL_LINES). Approximation:
      * GA_LINE_CNTL width and stipple are not modelled; draw quads when wide lines show up. */
     if(prim==2||prim==3||prim==12) {
@@ -602,11 +609,15 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
     uint32_t enabled=R(TX_ENABLE);
     for(unsigned u=0;u<OPTICS_DRAW_TEXTURES;u++) {
         if(!(d->us->textures>>u&1)) continue;
-        if(!(enabled>>u&1)) return refuse(reason,"fragment program samples a disabled texture unit");
-        uint32_t f0t=R(TX_FORMAT0_0+4*u),f1t=R(TX_FORMAT1_0+4*u),f2t=R(TX_FORMAT2_0+4*u),off=R(TX_OFFSET_0+4*u),flt=R(TX_FILTER0_0+4*u);
         OpticsTexture *t=&d->texture[u];
+        /* A disabled unit the program samples (Halo while it switches to full screen; gl-features: a unit without a
+         * texture): (0, 0, 0, 1), what ARB_fragment_program gives for a unit without a complete texture (Apple's software
+         * renderer gives white or black depending on what ran before). Unverified: the R300's own result. */
+        if(!(enabled>>u&1)){ memset(t,0,sizeof *t); t->absent=1; t->width=t->height=t->pitch=1; t->levels=1; t->bpp=4;
+            for(int c=0;c<4;c++) t->select[c]=(uint8_t)c; d->texture_mask|=1u<<u; continue; }
+        uint32_t f0t=R(TX_FORMAT0_0+4*u),f1t=R(TX_FORMAT1_0+4*u),f2t=R(TX_FORMAT2_0+4*u),off=R(TX_OFFSET_0+4*u),flt=R(TX_FILTER0_0+4*u);
         t->width=(f0t&0x7ff)+1; t->height=(f0t>>11&0x7ff)+1; t->pitch=f0t>>31?(f2t&0x3fff)+1:t->width;
-        t->format=f1t&31; t->offset=off&~31u;
+        t->format=f1t&31; t->offset=off&~31u; t->tile=(uint8_t)(off>>2&7);
         /* Decoded through the renderer's linear layouts: X8 -> R8, Y8X8 -> RG8, W8Z8Y8X8 -> RGBA8 (X first), the 16-bit
          * formats (X in the low bits) -> 565/4444/1555 whose RGBA decode is Z,Y,X,W. */
         static const uint8_t to_rgba[4]={2,1,0,3};
@@ -615,6 +626,8 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
         else if(t->format==0x3){t->layout=OPTICS_PIXEL_RG8;t->bpp=2;}   /* Y8X8: X byte first */
         else if(t->format==0xe){t->layout=OPTICS_PIXEL_RGBA8;t->bpp=8;d->approx|=OPTICS_APPROX_WIDE;}   /* W16Z16Y16X16: the executor keeps each high byte */
         else if(t->format==0x1){t->layout=OPTICS_PIXEL_R8;t->bpp=2;d->approx|=OPTICS_APPROX_WIDE;}     /* X16 (SimCity 4): the same */
+        else if(t->format==0xd){t->layout=OPTICS_PIXEL_RGBA8;t->bpp=4;d->approx|=OPTICS_APPROX_WIDE;}   /* W2Z10Y10X10: the executor rounds X, Y, Z to 8 bits */
+        else if(t->format==0x5){t->layout=OPTICS_PIXEL_RGBA8;t->bpp=1;}   /* Z3Y3X2: the executor expands each texel to X, Y, Z, 1 */
         else if(t->format==0x6){t->layout=OPTICS_PIXEL_RGB565_LE;t->bpp=2;map=to_rgba;}
         else if(t->format==0xa){t->layout=OPTICS_PIXEL_ARGB4444_LE;t->bpp=2;map=to_rgba;}
         else if(t->format==0xb){t->layout=OPTICS_PIXEL_ARGB1555_LE;t->bpp=2;map=to_rgba;}
@@ -630,7 +643,6 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
             const char *v=getenv("OPTICS_YUV422");if(v&&!strcmp(v,"0"))return refuse(reason,"YUV422 disabled (OPTICS_YUV422=0)");
             if((f1t>>22&3)!=1)return refuse(reason,"YUV422 requires clamped hardware CSC; raw/no-clamp needs separate float layout");
             if(t->width&1)return refuse(reason,"YUV422 needs complete chroma pairs");
-            if(off&0x1c)return refuse(reason,"tiled YUV422 is not a linear upload");
             d->approx|=OPTICS_APPROX_YUV601; /* Unverified: BT.601 coefficients, not checked against Tiger or hardware. */
             t->layout=optics_pixel_r300_yuv(f1t);t->bpp=2;
         }
@@ -659,6 +671,12 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
         if(t->floating && (t->depth || t->cube)) return refuse(reason,"3D or cube float texture");
         static const unsigned shift[4]={12,15,18,9};   /* output R,G,B,A select fields */
         for(unsigned c=0;c<4;c++){unsigned s=t->format==0x14||t->format==0x15?c:f1t>>shift[c]&7;if(s>5)return refuse(reason,"texture component select CUT_Z/W");t->select[c]=(uint8_t)(map&&s<4?map[s]:s);}
+        /* DXT1: the fourth code of a three-colour block is transparent black, alpha 0, also where the alpha select is ONE.
+         * Tiger's driver selects ONE for alpha in SimCity 4's DXT1 textures (Doom 3's too): with the select, its trees and
+         * buildings came out in black boxes (t678), with the block's alpha they look right (t681). Unverified against an
+         * R300: inferred from SimCity 4 drawing correctly on real Macs. OPTICS_DXT1_ALPHA=0 keeps the select. */
+        { static int on=-1; if(on<0){ const char *v=getenv("OPTICS_DXT1_ALPHA"); on=!v||atoi(v)!=0; }
+          if(on && t->format==0xf && t->select[3]==5) t->select[3]=3; }
         t->linear=(flt>>9&3)>=2;   /* 2 linear, 3 anisotropic */
         /* TX_FILTER0: CLAMP_S 2:0, CLAMP_T 5:3 (WRAP, MIRROR, CLAMP_TO_EDGE, MIRROR_ONCE_TO_EDGE, CLAMP, MIRROR_ONCE,
          * CLAMP_TO_BORDER, MIRROR_ONCE_TO_BORDER), MAG 10:9 and MIN 12:11 (1 point, 2 linear, 3 anisotropic), MIP 14:13
@@ -669,7 +687,7 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
          * together: in 461 of 517 mipmapped textures of HL and Doom 3 (a cube map among them) each level matched a 2x2
          * box filter of the level
          * above better in this layout than with rows padded to 32 bytes as R5xx Acceleration 4.1 describes for its parts,
-         * in none worse. Anisotropy: MAG/MIN 3; bits 23:21 were 3 in every such texture there. Unverified: read as log2 of
+         * in none worse; levels smaller than a micro tile are padded to it (texture_levels in frontend_metal.mm). Anisotropy: MAG/MIN 3; bits 23:21 were 3 in every such texture there. Unverified: read as log2 of
          * the largest ratio (8:1). */
         static const uint8_t address[8]={2,3,0,1,0,1,4,1};
         unsigned mip=flt>>13&3,levels=f0t>>26&15,full=1,aniso=(flt>>9&3)==3 || (flt>>11&3)==3 ? flt>>21&7 : 0;
@@ -714,12 +732,52 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
         t->sampler=as|at<<3|((flt>>9&3)>=2)<<6|((flt>>11&3)>=2)<<7|(t->levels>1?mip:0)<<8|aniso<<10|first<<13|(t->depth?address[flt>>6&7]:0)<<17;   /* CLAMP_R 8:6 */
         d->texture_mask|=1u<<u;
     }
+    { static int log=-1; static unsigned shown; static uint64_t seen[64]; static unsigned long n[64];
+      if(log<0){ const char *v=getenv("OPTICS_BLEND_LOG"); log=v&&atoi(v)!=0; }
+      if(log) {   /* development: RB3D_BLENDCNTL, FG_ALPHA_FUNC and texture 0 in use, when first seen and at 1000 and 100000 draws */
+          const OpticsTexture *t=&d->texture[0]; uint32_t a=R(0x4bd4)&0x1fff,f=d->texture_mask&1?t->format|(uint32_t)t->select[3]<<8:0xffff;
+          uint64_t h=(uint64_t)blend<<32^(uint64_t)a<<16^f; unsigned j=0; while(j<shown && seen[j]!=h) j++;
+          if(j==shown && shown<64){ seen[shown++]=h; n[j]=0; }
+          if(j<shown && (++n[j]==1 || n[j]==1000 || n[j]==100000)) fprintf(stderr,"optics-blend: %lu draws: blendcntl %08x alpha %03x tex0 %#x sel %u%u%u%u mask %x colour %x\n",
+              n[j],blend,a,f&0xff,t->select[0],t->select[1],t->select[2],t->select[3],d->texture_mask,d->color_mask);
+      } }
     return 1;
+}
+/* Polygons in line mode (draw.h polyline), after the build: each polygon's facing from its window positions (the CPU
+ * vertex stage; SU_CULL_MODE front_cw: clockwise in the R300's y-down window, as the executor's Metal winding) and
+ * culling, then the faces aos->faces selects in their mode: line mode draws the polygon's edges as lines, those whose
+ * first vertex has its edge flag (aos->edge) for separate triangles, quads and polygons (OpenGL's rule: strips and fans
+ * draw every edge), never the edges inside a quad or polygon; fill mode keeps the polygon's triangles. Approximation:
+ * a flat-shaded edge takes its first vertex's colour, not the polygon's provoking vertex's; no line stipple. */
+static int polyline(OpticsDraw *d,const uint32_t *reg,const OpticsAos *aos,const char **reason) {
+    uint32_t prim=d->poly_prim,count=d->poly_count,np,p,j,k,v[4],nout=0,tri=d->indices/3;
+    unsigned faces=aos && aos->faces?aos->faces:3,mode=faces==1?d->poly_front:faces==2?d->poly_back:1;
+    int flags=aos && aos->edge && (prim==4||prim==13||prim==15);
+    np=prim==4?count/3:prim==13?count/4:prim==15?count>=3:prim==14?(count>=4?(count-2)/2:0):count>=3?count-2:0;
+    OpticsVertexOut *vo=malloc((d->vertices?d->vertices:1)*sizeof *vo); uint8_t *keep=calloc(np?np:1,1);
+    uint32_t *out=malloc(((size_t)(mode==1?2*(prim==15?count:4*np):3*tri)+1)*sizeof *out);
+    if(!vo || !keep || !out){ free(vo); free(keep); free(out); return refuse(reason,"out of memory"); }
+    if(!optics_draw_vertices(d,vo,reason)){ free(vo); free(keep); free(out); return 0; }
+    for(p=0;p<np;p++) {
+        uint32_t n=prim==15?count:prim==13||prim==14?4:3; float area=0;
+        for(j=0;j<n && j<4;j++) v[j]=prim==4?3*p+j:prim==13?4*p+j:prim==15?j:prim==5?(j?p+j:0):prim==6?(p&1 && j<2?p+1-j:p+j):2*p+(j==2?3:j==3?2:j);
+        for(j=0;j<n;j++){ uint32_t a=prim==15?j:v[j],b=prim==15?(j+1)%n:v[(j+1)%n]; area+=vo[a].window[0]*vo[b].window[1]-vo[b].window[0]*vo[a].window[1]; }
+        int front=d->front_cw?area>0:area<0;
+        if((front?d->cull&1:d->cull&2) || !(faces&(front?1u:2u)) || (front?d->poly_front:d->poly_back)!=mode) continue;
+        keep[p]=1;
+        if(mode==1) for(j=0;j<n;j++){ uint32_t a=prim==15?j:v[j],b=prim==15?(j+1)%n:v[(j+1)%n];
+            if(!flags || aos->edge[a]){ out[nout++]=a; out[nout++]=b; } }
+    }
+    if(mode!=1) for(k=0;k<tri;k++){ p=prim==4||prim==5||prim==6?k:prim==15?0:k/2; if(p<np && keep[p]){ memcpy(out+nout,d->index+3*k,3*sizeof *out); nout+=3; } }
+    free(d->index); d->index=out; d->indices=nout; d->cull=0;
+    if(mode==1){ d->lines=1; d->line_width=(float)(R(0x4234)&0xffff)/6.0f; if(d->flat || d->stuff) d->approx|=OPTICS_APPROX_FIXED; }
+    free(vo); free(keep); return 1;
 }
 /* Failed builds never transfer ownership of partial vertex/index allocations. */
 int optics_draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300State *st,uint8_t opcode,const uint32_t *payload,uint32_t words,
     const OpticsAos *aos,OpticsFetch fetch,void *context,const char **reason) {
     int ok=draw_build(d,reg,st,opcode,payload,words,aos,fetch,context,reason);
+    if(ok && d->polyline) ok=polyline(d,reg,aos,reason);
     if(!ok)optics_draw_free(d);
     return ok;
 }

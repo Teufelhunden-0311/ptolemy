@@ -335,7 +335,11 @@ struct R2Slice {R2Lease *__strong lease;size_t offset;};
     NSMutableArray *_leases;NSMutableArray<PtR2Readback *> *_readbacks;
     NSMutableArray<PtR2Texture *> *_exports;
     NSMutableDictionary<NSData *,PtR2Program *> *_programs;
-    NSMutableDictionary<NSString *,id<MTLLibrary>> *_libraries;uint64_t _libraryCompiles,_libraryNS;   /* MSL compiled once per source */
+    NSMutableDictionary<NSString *,id<MTLLibrary>> *_libraries;uint64_t _libraryCompiles,_libraryNS,_libraryMaxNS,_librarySlow;   /* MSL compiled once per source; slow: 50 ms or more */
+    /* Libraries compiled in the background for a draw that waits (startLibrariesForPVS): _libLock guards _libraries and
+     * these, as completions arrive on Metal's threads. Failed sources go to preparePVS, which reports the error. */
+    std::mutex _libLock;NSMutableSet<NSString *> *_pendingSources,*_failedSources;dispatch_group_t _compiling;std::atomic<unsigned> _inFlight;
+    uint64_t _asyncCompiles,_asyncNS,_asyncMaxNS;
     /* Occlusion queries: every render pass writes Metal visibility results into _visibility (8-byte slots, a ring); a
      * query gets a fresh slot in each pass it draws in, so no pass resets or adds to another's count. */
     id<MTLBuffer> _visibility;uint32_t _visibilityNext,_passQuery,_passSlot;int64_t _boundVisibility;
@@ -369,7 +373,8 @@ struct R2Slice {R2Lease *__strong lease;size_t offset;};
     if(!function||!(_unpack=[device newComputePipelineStateWithFunction:function error:error]))return nil;
     if(!function3d||!(_unpack3d=[device newComputePipelineStateWithFunction:function3d error:error]))return nil;
     _visibility=[device newBufferWithLength:8*8192 options:MTLResourceStorageModeShared];_boundVisibility=-1;if(!_visibility){fail(error,@"Visibility buffer allocation failed");return nil;}
-    _programs=[NSMutableDictionary new];_libraries=[NSMutableDictionary new];_stencilStates=[NSMutableDictionary new];_log=os_log_create("org.ptolemy.optics","execution");
+    _programs=[NSMutableDictionary new];_libraries=[NSMutableDictionary new];_stencilStates=[NSMutableDictionary new];
+    _pendingSources=[NSMutableSet new];_failedSources=[NSMutableSet new];_compiling=dispatch_group_create();_log=os_log_create("org.ptolemy.optics","execution");
     for(unsigned i=0;i<2;i++) {
         MTLSamplerDescriptor *d=[MTLSamplerDescriptor new];d.minFilter=d.magFilter=i?MTLSamplerMinMagFilterLinear:MTLSamplerMinMagFilterNearest;
         d.sAddressMode=d.tAddressMode=MTLSamplerAddressModeClampToEdge;_sampler[i]=[device newSamplerStateWithDescriptor:d];
@@ -447,17 +452,15 @@ struct R2Slice {R2Lease *__strong lease;size_t offset;};
     memcpy((uint8_t *)_upload->buffer.contents+aligned,data,n);_uploadUsed=aligned+n;_snapshotBytes+=n;
     return {_upload,aligned};
 }
-- (PtR2Program *)preparePVS:(const PtR2ShaderIR *)pvs vertexInterface:(const PtR2ShaderInterface *)vi
-    fragment:(const PtR2ShaderIR *)us interface:(const PtR2ShaderInterface *)fi route:(PtR2Route)r error:(NSError **)error {
-    if(![self owner:error])return nil;
+/* What preparePVS refuses (nil: accepted); a route without a stride gets the PtR2Vertex layout. */
+static NSString *routeError(id<MTLDevice> device,const PtR2ShaderIR *pvs,const PtR2ShaderInterface *vi,const PtR2ShaderIR *us,const PtR2ShaderInterface *fi,PtR2Route &r) {
     if(!pvs||!us||!vi||!fi||pvs->stage!=PT_R2_SHADER_PVS||us->stage!=PT_R2_SHADER_US||pvs->textures||vi->input_count>16||
        r.vte>2||r.varyingCount>8||r.positionOutput>=vi->output_count||r.colorOutput>=fi->output_count||r.colorOutput>3||r.colorMask>15||r.blend>3||(r.blendState&&!blendValid(r))||!epilogueValid(r)||
        (us->outputs&~(1u<<r.colorOutput))||!(pvs->outputs&(1u<<r.positionOutput))||
-       (r.sampleCount!=1&&r.sampleCount!=2&&r.sampleCount!=4)||![_device supportsTextureSampleCount:r.sampleCount]) {
-        fail(error,@"Unsupported normalized stage, route, blend or sample count");return nil;
-    }
+       (r.sampleCount!=1&&r.sampleCount!=2&&r.sampleCount!=4)||![device supportsTextureSampleCount:r.sampleCount])
+        return @"Unsupported normalized stage, route, blend or sample count";
     uint32_t seen=0;for(unsigned j=0;j<r.varyingCount;j++) {
-        if(r.pvsOutput[j]>=vi->output_count||r.usInput[j]>=fi->input_count||(seen&(1u<<r.usInput[j]))) {fail(error,@"Invalid or duplicate varying route");return nil;}
+        if(r.pvsOutput[j]>=vi->output_count||r.usInput[j]>=fi->input_count||(seen&(1u<<r.usInput[j])))return @"Invalid or duplicate varying route";
         seen|=1u<<r.usInput[j];
     }
     if(!r.stride) {
@@ -467,9 +470,42 @@ struct R2Slice {R2Lease *__strong lease;size_t offset;};
     for(unsigned j=0;j<vi->input_count;j++) {
         PtR2Attribute a=r.attribute[j];unsigned size=optics_raw_width(a.format,a.components);
         if(size==UINT_MAX||a.offset>r.stride||size>r.stride-a.offset||
-           (a.format<OPTICS_RAW_INT&&r.vapSelect[j])||(a.format==OPTICS_RAW_DEFAULT&&(a.offset||r.vapSelect[j]))){fail(error,@"Unsupported or out-of-stride vertex attribute");return nil;}
+           (a.format<OPTICS_RAW_INT&&r.vapSelect[j])||(a.format==OPTICS_RAW_DEFAULT&&(a.offset||r.vapSelect[j])))return @"Unsupported or out-of-stride vertex attribute";
     }
-    if(r.fogSelect>5||(r.fog&&r.fogSelect<4&&r.fogOutput>=vi->output_count)||r.fog>1||r.clipPlanes>63||r.rop>16||r.textureFixed>1||r.pad2[0]||r.pad2[1]||r.discard>6||(r.generated>>r.varyingCount)){fail(error,@"Unsupported fixed-function route");return nil;}
+    if(r.fogSelect>5||(r.fog&&r.fogSelect<4&&r.fogOutput>=vi->output_count)||r.fog>1||r.clipPlanes>63||r.rop>16||r.textureFixed>1||r.pad2[0]||r.pad2[1]||r.discard>6||(r.generated>>r.varyingCount))return @"Unsupported fixed-function route";
+    return nil;
+}
+static MTLCompileOptions *compileOptions(){MTLCompileOptions *o=[MTLCompileOptions new];o.mathMode=MTLMathModeSafe;return o;}
+/* A draw's MSL libraries not compiled yet start compiling on Metal's threads (once per source); YES while any of them is
+ * still compiling, and wake() runs as each one completes. The caller's draw waits (the guest CPU runs meanwhile) and comes
+ * back to preparePVS, which finds them. An invalid route or a failed source: NO, preparePVS reports it. */
+- (BOOL)startLibrariesForPVS:(const PtR2ShaderIR *)pvs vertexInterface:(const PtR2ShaderInterface *)vi
+    fragment:(const PtR2ShaderIR *)us interface:(const PtR2ShaderInterface *)fi route:(PtR2Route)r wake:(void (^)(void))wake {
+    if(![self owner:nil]||routeError(_device,pvs,vi,us,fi,r))return NO;
+    NSString *vbody=body(pvs,vi,nil),*fbody=body(us,fi,nil);if(!vbody||!fbody)return NO;
+    BOOL waiting=NO;
+    for(NSString *source in @[vertexSource(vbody,vi,r),fragmentSource(fbody,us,fi,r)]) {
+        {std::lock_guard<std::mutex> g(_libLock);
+            if(_libraries[source]||[_failedSources containsObject:source])continue;
+            waiting=YES;if([_pendingSources containsObject:source])continue;[_pendingSources addObject:source];}
+        _inFlight++;dispatch_group_enter(_compiling);uint64_t t=nowNS();
+        [_device newLibraryWithSource:source options:compileOptions() completionHandler:^(id<MTLLibrary> l,NSError *err){
+            (void)err;uint64_t dt=nowNS()-t;
+            {std::lock_guard<std::mutex> g(self->_libLock);
+                if(l){if(self->_libraries.count>=1024)[self->_libraries removeAllObjects];self->_libraries[source]=l;} else [self->_failedSources addObject:source];
+                [self->_pendingSources removeObject:source];self->_asyncCompiles++;self->_asyncNS+=dt;self->_asyncMaxNS=std::max(self->_asyncMaxNS,dt);}
+            self->_inFlight--;if(wake)wake();dispatch_group_leave(self->_compiling);
+        }];
+    }
+    return waiting;
+}
+- (unsigned)librariesCompiling {return _inFlight.load();}
+- (uint64_t)asyncStat:(int)k {std::lock_guard<std::mutex> g(_libLock);return k==0?_asyncCompiles:k==1?_asyncNS:_asyncMaxNS;}
+- (void)waitForLibraries {dispatch_group_wait(_compiling,DISPATCH_TIME_FOREVER);}
+- (PtR2Program *)preparePVS:(const PtR2ShaderIR *)pvs vertexInterface:(const PtR2ShaderInterface *)vi
+    fragment:(const PtR2ShaderIR *)us interface:(const PtR2ShaderInterface *)fi route:(PtR2Route)r error:(NSError **)error {
+    if(![self owner:error])return nil;
+    if(NSString *why=routeError(_device,pvs,vi,us,fi,r)){fail(error,why);return nil;}
     NSMutableData *key=[NSMutableData new];word(key,1);
     for(unsigned stage=0;stage<2;stage++) {
         uint8_t bytes[16384];size_t n=0;PtR2ShaderError e={};
@@ -491,14 +527,15 @@ struct R2Slice {R2Lease *__strong lease;size_t offset;};
     PtR2Program *p=[PtR2Program new];p->runtime=_runtime;p->epoch=_runtime->epoch;p->route=r;p->textureMask=us->textures;
     p->vertexConstantBytes=constantBytes(pvs);p->fragmentConstantBytes=constantBytes(us);
     p.vertexMSL=vertexSource(vbody,vi,r);p.fragmentMSL=fragmentSource(fbody,us,fi,r);
-    MTLCompileOptions *options=[MTLCompileOptions new];options.mathMode=MTLMathModeSafe;
+    MTLCompileOptions *options=compileOptions();
     /* Programs that differ only in blend, write mask or other pipeline state have the same vertex or fragment MSL
      * (Halo compiled 888 programs in 38 s before this); each source is compiled once (a bounded table,
-     * dropped whole like the program cache). */
+     * dropped whole like the program cache). Here the caller waits for the compile (startLibrariesForPVS does not). */
     auto library=[&](NSString *source)->id<MTLLibrary> {
-        id<MTLLibrary> l=_libraries[source];if(l)return l;
-        uint64_t t=nowNS();l=[_device newLibraryWithSource:source options:options error:error];_libraryNS+=nowNS()-t;_libraryCompiles++;
-        if(l){if(_libraries.count>=1024)[_libraries removeAllObjects];_libraries[source]=l;}
+        {std::lock_guard<std::mutex> g(_libLock);id<MTLLibrary> l=_libraries[source];if(l)return l;}
+        uint64_t t=nowNS();id<MTLLibrary> l=[_device newLibraryWithSource:source options:options error:error];t=nowNS()-t;_libraryNS+=t;_libraryCompiles++;
+        _libraryMaxNS=std::max(_libraryMaxNS,t);_librarySlow+=t>=50000000u;
+        if(l){std::lock_guard<std::mutex> g(_libLock);if(_libraries.count>=1024)[_libraries removeAllObjects];_libraries[source]=l;}
         return l;
     };
     id<MTLLibrary> vl=library(p.vertexMSL);
@@ -1053,7 +1090,8 @@ struct R2Slice {R2Lease *__strong lease;size_t offset;};
     return @{@"passBreaks":reasons,@"component":@"optics",@"abi":@1,@"device":_device.name,@"epoch":@(_runtime->epoch),@"residentBytes":@(_runtime->resident),@"peakBytes":@(_runtime->peak),
         @"inflightBatches":@(_runtime->inflight),@"completedUnpolled":@(_runtime->completions.size()),@"draws":@(_draws),@"commits":@(_commits),
         @"completionPrefix":@(_completionPrefix),@"retiredOutOfOrder":@(_runtime->retired.size()),
-        @"renderPasses":@(_passes),@"backpressure":@(_busy),@"programsCompiled":@(_compiled),@"compileNS":@(_compileNS),@"librariesCompiled":@(_libraryCompiles),@"libraryNS":@(_libraryNS),@"gpuFailed":@(_runtime->failed),
+        @"renderPasses":@(_passes),@"backpressure":@(_busy),@"programsCompiled":@(_compiled),@"compileNS":@(_compileNS),@"librariesCompiled":@(_libraryCompiles),@"libraryNS":@(_libraryNS),@"libraryMaxNS":@(_libraryMaxNS),@"librariesSlow":@(_librarySlow),
+        @"librariesAsync":@([self asyncStat:0]),@"libraryAsyncNS":@([self asyncStat:1]),@"libraryAsyncMaxNS":@([self asyncStat:2]),@"gpuFailed":@(_runtime->failed),
         @"bufferAllocations":@(_bufferAllocations),@"snapshotBytes":@(_snapshotBytes),
         @"bindingCache":@(_cacheBindings),@"stateBindRequests":@(_stateCalls),@"stateBindsSkipped":@(_stateSkipped),
         @"lastGPUError":[NSString stringWithUTF8String:_runtime->error.c_str()],

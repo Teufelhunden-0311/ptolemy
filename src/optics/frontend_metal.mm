@@ -31,6 +31,7 @@ extern "C" {
 #include <set>
 #include <unordered_map>
 #include <vector>
+#include <string>
 
 namespace {
 /* clear: pending fast clear planes (1 colour, 2 depth); version: unique per modification (scanout publication) */
@@ -99,13 +100,18 @@ struct KeyHash { size_t operator()(const ProgramKey &k) const {
 struct KeyEq { bool operator()(const ProgramKey &a,const ProgramKey &b) const { return !memcmp(&a,&b,KEY_BYTES); } };
 /* A texture's bytes from TX_OFFSET as Tiger's driver stores them (draw.c): levels one after another from the largest, a
  * level's cube faces (3D: its slices, depth >> level) together, rows of the pitch at level 0 and of exactly the width
- * below. Returns the total. */
+ * below. Micro-tiled (TX_OFFSET [4:3] = 1; Tiger's driver tiles every texture it uploads): each level whole 32-byte
+ * micro tiles, 8 bytes by 4 rows for one-byte texels, 32 by 1 for 16-byte elements (DXT3/5 blocks), 16 by 2 otherwise,
+ * so a small level's rows and row count are padded; the bytes stay in linear order (the CPU writes through a de-tiling
+ * surface, not modelled). Measured with gl-features --layout and Halo's textures (OPTICS_TEXTURE_DUMP). Returns the
+ * total. */
 static size_t texture_levels(const OpticsTexture *t,PtR2Levels *lv) {
-    size_t total=0; unsigned bpp=t->bpp; lv->levels=t->levels;
+    size_t total=0; unsigned bpp=t->bpp,micro=(t->tile>>1&3)==1,tw=bpp==1?8:bpp>=16?32:16,th=bpp==1?4:bpp>=16?1:2; lv->levels=t->levels;
     for(unsigned k=0;k<t->levels;k++) {
         uint32_t w=std::max(1u,t->width>>k),h=std::max(1u,t->height>>k),faces=t->cube?6:std::max(1u,t->depth>>k);
-        lv->row[k]=(size_t)OPTICS_PIXEL_UNITS(t->layout,k?w:t->pitch)*bpp; lv->face[k]=lv->row[k]*OPTICS_PIXEL_UNITS(t->layout,h);   /* DXT: rows of blocks */
-        lv->offset[k]=total; total+=lv->face[k]*faces;
+        size_t row=(size_t)OPTICS_PIXEL_UNITS(t->layout,k?w:t->pitch)*bpp,rows=OPTICS_PIXEL_UNITS(t->layout,h);   /* DXT: rows of blocks */
+        if(micro){ row=(row+tw-1)/tw*tw; rows=(rows+th-1)/th*th; }
+        lv->row[k]=row; lv->face[k]=row*rows; lv->offset[k]=total; total+=lv->face[k]*faces;
     }
     return total;
 }
@@ -160,6 +166,11 @@ struct Exec {
     uint64_t upload_ns=0; uint32_t upload_last[5]={};   /* OPTICS_HITCH: time in texture uploads; the last one's width, height, format, bytes, VRAM */
     std::vector<Cached> cache; uint64_t cache_lo=UINT64_MAX,cache_hi=0,cache_bytes=0,cache_adds=0;   /* oldest first; ranges for invalidation; entries ever added */
     std::unordered_map<TexKey,PtR2Texture *,TexHash> cache_index;                       /* the same entries by identity */
+    /* CPU-side exports of a depth buffer with a pending fast clear while ZB_FORMAT is another buffer's (the range a
+     * sampled texture or a CPU access covers overlaps a neighbour's recorded extent): not exported, the clear stays
+     * pending for the buffer's next draw and the access sees VRAM, as with the clear still in the card's ZMASK. */
+    uint64_t clear_skips=0;
+    PtR2Texture *absent_texture=nil;                                                   /* 1 x 1 (0, 0, 0, 1) for disabled units (draw.h absent) */
     std::unordered_map<TexKey,PtR2Texture *,TexHash> gart; std::deque<std::pair<TexKey,size_t>> gart_order; uint64_t gart_bytes=0,stats_gart_hits=0;   /* GART textures, oldest first */
     std::unordered_map<ProgramKey,PtR2Program *,KeyHash,KeyEq> programs;
     ProgramKey last_key; PtR2Program *last_program=nil; bool last_valid=false;   /* consecutive draws mostly share one (the hash was 3.5% of the thread) */
@@ -339,7 +350,8 @@ struct Exec {
         if(y0>=y1) return true;
         if(z.clear){
             OpticsDraw state={};state.depth_clear_word=optics_frontend_register(dev,0x4f28);state.depth_clear_format=optics_frontend_register(dev,0x4f10);
-            const char *why=nullptr;int code=OPTICS_EXEC_FAILED;if((state.depth_clear_format&15)!=z.format||!apply_depth_clear(z,&state,&why,&code))return false;
+            if((state.depth_clear_format&15)!=z.format){ clear_skips++; return true; }   /* see clear_skips */
+            const char *why=nullptr;int code=OPTICS_EXEC_FAILED;if(!apply_depth_clear(z,&state,&why,&code))return false;
         }
         NSError *e=nil;PtR2Readback *rb=retry([&]{return owner.on([&]{return [renderer readbackDepth:z.depth y:y0 height:y1-y0 error:&e];});},&e);
         NSData *data=nil;if(rb&&commit(&e)&&drain())data=owner.on([&]{return [renderer copyDepthReadback:rb format:z.format error:&e];});
@@ -351,7 +363,7 @@ struct Exec {
         unwatch(z.watch);
         if(stride==row && pt_r2_io_cpu_write(io(),a,data.bytes,data.length,0)!=PT_R2_IO_OK){broken=true;return false;}
         for(uint32_t y=y0;stride!=row && y<y1;y++) if(pt_r2_io_cpu_write(io(),z.start+(uint64_t)y*stride,(const uint8_t *)data.bytes+(size_t)(y-y0)*row,row,0)!=PT_R2_IO_OK){broken=true;return false;}
-        if(!watch(z.watch,z.start,z.end-z.start)){broken=true;return false;}
+        (void)watch(z.watch,z.start,z.end-z.start);   /* if this fails (a page another surface owns), it stays unwatched (materialize) */
         invalidate(a,a+n);stats_writebacks++;return true;
     }
     /* One lazy export per dirty version, not per CPU read or end of pass. */
@@ -359,7 +371,7 @@ struct Exec {
         if(!z.linear_io)return true;
         if(z.clear){
             OpticsDraw state={};state.depth_clear_word=optics_frontend_register(dev,0x4f28);state.depth_clear_format=optics_frontend_register(dev,0x4f10);
-            if((state.depth_clear_format&15)!=z.format){broken=true;return false;}
+            if((state.depth_clear_format&15)!=z.format){ clear_skips++; return true; }   /* see clear_skips */
             const char *why=nullptr;int code=OPTICS_EXEC_FAILED;if(!apply_depth_clear(z,&state,&why,&code))return false;
         }
         if(!z.dirty)return true;
@@ -368,10 +380,10 @@ struct Exec {
         if(!data||data.length!=z.end-z.start){NSLog(@"optics-frontend: depth export failed: %@",e);broken=true;return false;}
         unwatch(z.watch); std::vector<uint8_t> out((const uint8_t *)data.bytes,(const uint8_t *)data.bytes+data.length);
         PtR2IoResult r=z.own.id?pt_r2_io_write_complete(io(),z.own,out.data(),out.size()):pt_r2_io_cpu_write(io(),z.start,out.data(),out.size(),0); z.own=PtR2IoToken{};
-        if(r!=PT_R2_IO_OK||!watch(z.watch,z.start,z.end-z.start)){
-            broken=true;return false;
-        }
-        invalidate(z.start,z.end);z.dirty=false;stats_writebacks++;return true;
+        if(r!=PT_R2_IO_OK){broken=true;return false;}
+        invalidate(z.start,z.end);z.dirty=false;stats_writebacks++;
+        (void)watch(z.watch,z.start,z.end-z.start);   /* if this fails (a page another surface owns), materialize drops the buffer */
+        return true;
     }
     int materialize(uint64_t start,uint64_t end,int write) {
         if(busy) return 0;
@@ -381,6 +393,10 @@ struct Exec {
                 if(depths[i].linear_io&&!write_depth(depths[i]))return -1;
                 if(write){ forget_depth(depths[i]); depths.erase(depths.begin()+i); depth_drops++; continue; }
                 if(!depths[i].linear_io&&depth_io()&&!export_depth(depths[i],start,end))return -1;
+                /* A linear buffer exported whole that could not be watched again (a page another surface owns): VRAM is
+                 * current, so it is dropped and the next draw imports it. A GPU-only buffer exported in part stays,
+                 * unwatched (approximation: a later CPU write to it is not seen). */
+                if(depths[i].linear_io && !depths[i].dirty && !depths[i].clear && !depths[i].own.id && !depths[i].watch.id){ forget_depth(depths[i]); depths.erase(depths.begin()+i); depth_drops++; continue; }
                 if(!depths[i].linear_io&&!depth_io()&&!depth_reads_refused++) NSLog(@"optics-frontend: CPU read of a GPU depth buffer at %#llx: VRAM bytes served (OPTICS_DEPTH_IO=0)",(unsigned long long)depths[i].zb);
             }
             i++;
@@ -433,6 +449,23 @@ struct Exec {
             fprintf(f,"P6\n%u %u\n255\n",b.w/2,b.h/2);
             for(uint32_t y=0;y+1<b.h;y+=2) for(uint32_t x=0;x+1<b.w;x+=2){const uint8_t *p=&px[((size_t)y*b.w+x)*4];uint8_t rgb[3]={p[2],p[1],p[0]};fwrite(rgb,1,3,f);}
             fclose(f);
+        }
+        /* OPTICS_SURFACE_DUMP_SMALL=1 (development): ARGB8888 targets up to 256x256 too (shadow maps), whole, colour
+         * (small-TAG-GPU.ppm) and alpha (.pgm) */
+        static int small=-1; if(small<0){const char *v=getenv("OPTICS_SURFACE_DUMP_SMALL");small=v&&atoi(v)!=0;}
+        std::vector<Big> few; if(small) for(auto &s:owned) if(s.fmt==6 && s.width<=256 && s.height<=256 && few.size()<16) few.push_back({s.gpu,s.width,s.height});
+        for(auto &b:few) {
+            uint64_t start; if(!optics_frontend_vram_offset(dev,b.gpu,&start)) continue;
+            if(materialize(start,start+(uint64_t)b.w*4*b.h,0)) continue;
+            std::vector<uint8_t> px((size_t)b.w*b.h*4); busy=true; int ok=optics_frontend_gpu_read(dev,b.gpu,px.data(),px.size()); busy=false;
+            if(!ok) continue;
+            for(int a=0;a<2;a++) {
+                char name[1024]; snprintf(name,sizeof name,"%s/small-%02u-%llx.%s",dir,tag,(unsigned long long)b.gpu,a?"pgm":"ppm");
+                FILE *f=fopen(name,"wb"); if(!f) continue;
+                fprintf(f,"P%c\n%u %u\n255\n",a?'5':'6',b.w,b.h);
+                for(size_t i=0;i<(size_t)b.w*b.h;i++){const uint8_t *p=&px[i*4]; if(a) fputc(p[3],f); else {uint8_t rgb[3]={p[2],p[1],p[0]};fwrite(rgb,1,3,f);}}
+                fclose(f);
+            }
         }
     }
     int clear(uint64_t gpu,int plane) {
@@ -669,14 +702,15 @@ struct Exec {
     void close() {
         owner.closeAdmission();owner.barrier();
         if(!renderer) return;
+        [renderer waitForLibraries];   /* their completions wake this device */
         NSError *e=nil; commit(&e); (void)drain();
         NSDictionary *g=owner.on([&]{return [renderer diagnostics];});
         NSLog(@"optics-frontend: executor draws %llu imports %llu writebacks %llu commits %llu, textures %llu uploaded %llu reused (%llu GART by content); renderer batches %@, GPU %.3f s, "
-              "submit->callback mean %@ ns max %@ ns, passes %@, programs %@ (MSL libraries %@; compiling %.1f s, of it MSL %.1f s), backpressure %@; depth storages %zu live, %llu dropped by CPU writes, %llu CPU reads of GPU depth served from VRAM",
+              "submit->callback mean %@ ns max %@ ns, passes %@, programs %@ (MSL libraries %@; compiling %.1f s, of it MSL %.1f s; %@ libraries took 50 ms or more, the longest %.0f ms; in the background while draws waited: %@ libraries, %.1f s, the longest %.0f ms), backpressure %@; depth storages %zu live, %llu dropped by CPU writes, %llu CPU reads of GPU depth served from VRAM, %llu exports skipped (pending clear, another ZB_FORMAT)",
               (unsigned long long)stats_draws,(unsigned long long)stats_imports,(unsigned long long)stats_writebacks,(unsigned long long)stats_commits,
               (unsigned long long)stats_texture_uploads,(unsigned long long)stats_texture_hits,(unsigned long long)stats_gart_hits,g[@"epochCompletedBatches"],[g[@"epochGPUSeconds"] doubleValue],
-              g[@"epochMeanSubmitToCallbackNS"],g[@"epochMaxSubmitToCallbackNS"],g[@"renderPasses"],g[@"programsCompiled"],g[@"librariesCompiled"],[g[@"compileNS"] doubleValue]/1e9,[g[@"libraryNS"] doubleValue]/1e9,g[@"backpressure"],
-              depths.size(),(unsigned long long)depth_drops,(unsigned long long)depth_reads_refused);
+              g[@"epochMeanSubmitToCallbackNS"],g[@"epochMaxSubmitToCallbackNS"],g[@"renderPasses"],g[@"programsCompiled"],g[@"librariesCompiled"],[g[@"compileNS"] doubleValue]/1e9,[g[@"libraryNS"] doubleValue]/1e9,g[@"librariesSlow"],[g[@"libraryMaxNS"] doubleValue]/1e6,g[@"librariesAsync"],[g[@"libraryAsyncNS"] doubleValue]/1e9,[g[@"libraryAsyncMaxNS"] doubleValue]/1e6,g[@"backpressure"],
+              depths.size(),(unsigned long long)depth_drops,(unsigned long long)depth_reads_refused,(unsigned long long)clear_skips);
         NSLog(@"optics-frontend: full GPU VTE draws %llu",(unsigned long long)stats_vte2_draws);
         NSLog(@"optics-frontend: batch latency: submit->GPU start mean %@ ns, GPU end->callback mean %@ ns",g[@"epochMeanSubmitToStartNS"],g[@"epochMeanEndToCallbackNS"]);
         NSLog(@"optics-frontend: GPU raw vertex draws %llu, input snapshot bytes %llu",(unsigned long long)stats_raw_draws,(unsigned long long)stats_raw_bytes);
@@ -691,6 +725,7 @@ int Exec::draw(const OpticsDraw *d,const char **why) {
         NSError *e=nil;
         if(broken) return failhard(why,"executor after a GPU failure",nil);
         if(!ensure(&e)) return fail(why,"Metal renderer unavailable",e);
+        if(d->defer && [renderer librariesCompiling]) return OPTICS_EXEC_BUSY;   /* this draw's shader still compiles */
         if(!d->indices || (d->cull==3 && cull_mode())) return OPTICS_EXEC_DONE;   /* both faces culled: nothing to draw */
         uint32_t W=d->width,H=d->height; uint64_t start; uint8_t cfmt=d->cb_format?d->cb_format:6;   /* hand-built draws leave cb_format 0 */
         if(!W || !H || W>8192 || H>8192) return fail(why,"target size",nil);
@@ -746,8 +781,15 @@ int Exec::draw(const OpticsDraw *d,const char **why) {
         unsigned top=0; for(unsigned u=0;u<OPTICS_DRAW_TEXTURES;u++) if(d->texture_mask>>u&1) top=u+1;
         NSMutableArray *textures=top?[NSMutableArray arrayWithCapacity:top]:nil;   /* PtR2Texture, NSNull placeholders until filled; none: no array per draw */
         for(unsigned u=0;u<top;u++) {
-            const OpticsTexture *t=&d->texture[u]; PtR2Levels lv; size_t n=texture_levels(t,&lv); uint64_t to;
+            const OpticsTexture *t=&d->texture[u];
             if(!(d->texture_mask>>u&1)) { [textures addObject:[NSNull null]]; continue; }
+            if(t->absent) {
+                static const uint8_t black[4]={0,0,0,255}; OpticsPixelLayout l={OPTICS_PIXEL_RGBA8,{0,1,2,3}};
+                if(!absent_texture) absent_texture=retry([&]{return owner.on([&]{return [renderer textureWidth:1 height:1 bytes:black rowBytes:4 layout:l error:&e];});},&e);
+                if(!absent_texture) return failhard(why,"texture upload",e);
+                [textures addObject:absent_texture]; continue;
+            }
+            PtR2Levels lv; size_t n=texture_levels(t,&lv); uint64_t to;
             if(optics_frontend_vram_offset(dev,t->offset,&to)) {
                 /* A GPU-owned ARGB8888 (ARGB16161616) surface sampled whole as W8Z8Y8X8 (W16Z16Y16X16): a swizzled view of its target, no readback.
                  * Its top-left part (the window server samples a window's visible width of its padded backing
@@ -791,7 +833,7 @@ int Exec::draw(const OpticsDraw *d,const char **why) {
             }
             uint32_t key[10]={(uint32_t)t->offset,t->width,t->height,t->pitch,t->format,
                 (uint32_t)t->select[0]|t->select[1]<<8|t->select[2]<<16|(uint32_t)t->select[3]<<24,(uint32_t)t->linear|(uint32_t)t->levels<<8|t->depth<<16,
-                (uint32_t)t->layout|(uint32_t)t->swap<<8|(uint32_t)t->cube<<16};
+                (uint32_t)t->layout|(uint32_t)t->swap<<8|(uint32_t)t->cube<<16|(uint32_t)t->tile<<24};
             uint64_t vram_off; int in_vram=optics_frontend_vram_offset(dev,t->offset,&vram_off);
             PtR2Texture *x=nil;
             TexKey tk; memcpy(tk.k,key,sizeof key);
@@ -806,6 +848,16 @@ int Exec::draw(const OpticsDraw *d,const char **why) {
                     uint64_t h=content_hash(texels.data(),n); tk.k[8]=(uint32_t)h; tk.k[9]=(uint32_t)(h>>32);
                     auto hit=gart.find(tk); if(hit!=gart.end()){ x=hit->second; stats_texture_hits++; stats_gart_hits++; [textures addObject:x]; continue; }
                 }
+                {   /* development, OPTICS_TEXTURE_DUMP=DIR: mipmapped textures' VRAM bytes from TX_OFFSET, as stored (twice the size
+                     * texture_levels gives, at least 64 KiB), each name once, at most 3000, to work out the driver's layout of mip levels */
+                    static const char *dir=getenv("OPTICS_TEXTURE_DUMP"),*skip=getenv("OPTICS_TEXTURE_DUMP_SKIP"); static std::vector<std::string> done;   /* SKIP: formats as "0c 0f" */
+                    char code[4]; snprintf(code,sizeof code,"%02x",t->format);
+                    char p[512]; snprintf(p,sizeof p,"%s/tex-%08x-f%02x-%ux%u-l%u-t%u-p%u-c%u-d%u.bin",dir?dir:"",t->offset,t->format,t->width,t->height,t->levels,t->tile,t->pitch,t->cube,t->depth);
+                    if(dir && t->levels>1 && done.size()<3000 && !(skip && strstr(skip,code)) && std::find(done.begin(),done.end(),p)==done.end()) {
+                        size_t k=std::max<size_t>(2*n,65536); std::vector<uint8_t> raw(k); done.push_back(p);
+                        busy=true; int got=optics_frontend_gpu_read(dev,t->offset,raw.data(),k); busy=false;
+                        FILE *f=got?fopen(p,"wb"):NULL; if(f){ fwrite(raw.data(),1,k,f); fclose(f); } }
+                }
                 optics_texture_unswap(t,texels.data(),n);
                 {   /* development, OPTICS_DXT_DUMP=1: raw DXT block bytes (to check a decode against the guest's data) */
                     static int on=-1; static unsigned shown; if(on<0){const char *v=getenv("OPTICS_DXT_DUMP"); on=v&&atoi(v)!=0;}
@@ -818,6 +870,15 @@ int Exec::draw(const OpticsDraw *d,const char **why) {
                 if(t->format==0xe||t->format==0x1){   /* W16Z16Y16X16 and X16 LE: high bytes, in place; every offset and row halves */
                     for(size_t i=0;i<n/2;i++)texels[i]=texels[2*i+1];
                     m=n/2; for(unsigned k=0;k<lv.levels;k++){lv.offset[k]/=2;lv.row[k]/=2;lv.face[k]/=2;}
+                }
+                else if(t->format==0xd){   /* W2Z10Y10X10 LE: X, Y, Z rounded to 8 bits and W at 2, in place */
+                    for(size_t i=0;i+4<=n;i+=4){ uint32_t v=(uint32_t)texels[i]|(uint32_t)texels[i+1]<<8|(uint32_t)texels[i+2]<<16|(uint32_t)texels[i+3]<<24;
+                        for(int c=0;c<3;c++) texels[i+c]=(uint8_t)(((v>>(10*c)&1023u)*255u+511u)/1023u); texels[i+3]=(uint8_t)((v>>30)*85u); }
+                }
+                else if(t->format==0x5){   /* Z3Y3X2: X (2 bits), Y, Z (3 bits) and one as bytes; every offset and row four times */
+                    std::vector<uint8_t> q(n*4);
+                    for(size_t i=0;i<n;i++){ unsigned v=texels[i]; q[4*i]=(uint8_t)((v&3u)*85u); q[4*i+1]=(uint8_t)(((v>>2&7u)*255u+3u)/7u); q[4*i+2]=(uint8_t)(((v>>5)*255u+3u)/7u); q[4*i+3]=255; }
+                    texels.swap(q); m=n*4; for(unsigned k=0;k<lv.levels;k++){lv.offset[k]*=4;lv.row[k]*=4;lv.face[k]*=4;}
                 }
                 OpticsPixelLayout l={t->layout,{t->select[0],t->select[1],t->select[2],t->select[3]}};
                 if(t->floating){ std::vector<float> f=float_texels(t,texels.data(),&lv);
@@ -1006,6 +1067,11 @@ int Exec::draw(const OpticsDraw *d,const char **why) {
             auto found=programs.find(key);
             if(found!=programs.end()) program=found->second;
             else {
+                /* A shader not compiled yet: compiled on Metal's threads while this draw waits in the ring and the device lock
+                 * is free (a 100-200 ms first compile no longer stops the guest CPU, its sound and input); woken on completion. */
+                PtRadeon *wake=dev;
+                if(d->defer && owner.on([&]{return [renderer startLibrariesForPVS:pvs vertexInterface:&vi fragment:d->us interface:&d->fi route:r
+                                                     wake:^{optics_frontend_wake(wake);}];})) return OPTICS_EXEC_BUSY;
                 program=owner.on([&]{return [renderer preparePVS:pvs vertexInterface:&vi fragment:d->us interface:&d->fi route:r error:&e];}); stats_compiles++;
                 if(programs.size()>=2048) programs.clear();   /* bounded; draws in flight keep theirs */
                 programs.emplace(key,program);
@@ -1096,6 +1162,7 @@ void x_frame_release(void *handle) { if(handle) CFRelease(handle); }   /* the re
 void x_dump(void *o,PtRadeon *,const char *dir,unsigned tag) { @autoreleasepool { at(o)->dump(dir,tag); } }
 void x_status(void *o,PtRadeon *,OpticsStatus *s) { Exec *x=(Exec *)o; if(x && x->renderer) @autoreleasepool { at(x)->owner.on([&]{optics_status_renderer(s,x->renderer);}); } }
 }
-static const OpticsExecutor table={x_create,x_destroy,x_reset,x_draw,x_materialize,x_clear,x_fence,x_poll,x_frame,x_frame_release,x_dump,x_status,x_query};
+static int x_compiling(void *o) { Exec *x=(Exec *)o; return x && x->renderer && [x->renderer librariesCompiling]; }   /* the CP thread, as draw */
+static const OpticsExecutor table={x_create,x_destroy,x_reset,x_draw,x_materialize,x_clear,x_fence,x_poll,x_frame,x_frame_release,x_dump,x_status,x_query,x_compiling};
 const OpticsExecutor *optics_metal_executor(void) { return &table; }
 __attribute__((constructor)) static void install(void) { optics_frontend_set_executor(&table); }

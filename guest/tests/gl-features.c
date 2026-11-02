@@ -4,10 +4,13 @@
  * pixel within the case's tolerance at the same place or one pixel away, so rasterisation rules that differ by a
  * pixel at an edge do not count. One line per case:
  *   <id> pass|FAIL|skip unmatched=N maxdiff=M lit=ATI/SW
- * Usage: gl-features [--out DIR] [case-prefix...] | gl-features --gpu-state | gl-features --msaa
+ * Usage: gl-features [--out DIR] [case-prefix...] | gl-features --gpu-state | gl-features --msaa |
+ *        gl-features --upload FORMAT-CASE SECONDS | gl-features --alpha
  *   --out DIR writes DIR/<id>-ati.ppm and DIR/<id>-sw.ppm for every case run.
  *   --gpu-state prints whether the accelerated renderer processes each polygon mode on the GPU.
  *   --msaa draws full screen with multisampling and counts antialiased edge pixels (link with ApplicationServices).
+ *   --upload re-uploads a format case's texture at 512 x 512 and draws it, for SECONDS (for the CPU profiler).
+ *   --alpha checks RGBA bytes converted to GL_RGB5_A1 by the driver texel for texel, at widths from 4 to 512.
  * Build in Tiger: gcc -O2 -o gl-features gl-features.c -framework OpenGL */
 #include <ApplicationServices/ApplicationServices.h>
 #include <OpenGL/OpenGL.h>
@@ -17,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifndef GL_TEXTURE_FILTER_CONTROL_EXT
 #define GL_TEXTURE_FILTER_CONTROL_EXT 0x8500
@@ -211,6 +215,19 @@ static void s_point_vertex_size(void)
     dots();
     glDisable(GL_VERTEX_PROGRAM_POINT_SIZE_ARB); glDisable(GL_VERTEX_PROGRAM_ARB); glDeleteProgramsARB(1, &id);
 }
+static void s_program_unbound_texture(void)
+{
+    /* An ARB fragment program samples unit 1, which has no texture: (0, 0, 0, 1) by ARB_fragment_program. Against that
+     * expected image: Apple's software renderer gives white or black depending on what ran before. */
+    static const char fp[] = "!!ARBfp1.0\nTEX result.color, fragment.texcoord[0], texture[1], 2D;\nEND\n";
+    GLuint id;
+    reset();
+    glGenProgramsARB(1, &id); glBindProgramARB(GL_FRAGMENT_PROGRAM_ARB, id);
+    glProgramStringARB(GL_FRAGMENT_PROGRAM_ARB, GL_PROGRAM_FORMAT_ASCII_ARB, (GLsizei)strlen(fp), fp);
+    glEnable(GL_FRAGMENT_PROGRAM_ARB);
+    textured_quad(32, 32, 96, 96, 0, 0, 1, 1);
+    glDisable(GL_FRAGMENT_PROGRAM_ARB); glDeleteProgramsARB(1, &id);
+}
 
 static GLuint checker_texture(int size)
 {
@@ -270,6 +287,40 @@ static void s_polygon_point(void) { reset(); glPointSize(3); glPolygonMode(GL_FR
 static void s_polygon_front_line(void)
 {
     reset(); glPolygonMode(GL_FRONT, GL_LINE); glPolygonMode(GL_BACK, GL_FILL); fan_of_triangles();
+}
+static void s_polygon_line_quads(void)
+{
+    /* Quads, a quad strip and a triangle strip in line mode: the quads' outlines (no diagonals), the strip's every edge. */
+    int i;
+    reset(); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+    glColor3ub(250, 200, 50); glBegin(GL_QUADS); glVertex2f(8, 8); glVertex2f(56, 12); glVertex2f(52, 56); glVertex2f(10, 50); glEnd();
+    glColor3ub(60, 200, 250); glBegin(GL_QUAD_STRIP);
+    for (i = 0; i < 4; i++) { glVertex2f(68 + 18 * i, 10); glVertex2f(70 + 18 * i, 56); }
+    glEnd();
+    glColor3ub(200, 90, 220); glBegin(GL_TRIANGLE_STRIP);
+    for (i = 0; i < 6; i++) glVertex2f(10 + 22 * i, i & 1 ? 120 : 76);
+    glEnd();
+}
+static void s_polygon_line_cull(void)
+{
+    /* Line mode with back faces culled: the counter-clockwise (front) triangles' edges only. */
+    reset(); glEnable(GL_CULL_FACE); glCullFace(GL_BACK); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); fan_of_triangles();
+}
+static void s_polygon_edge_flags(void)
+{
+    /* A quad as two triangles in line mode, the shared diagonal flagged off (a vertex's flag is for the edge it starts):
+     * only the outline is drawn; then a pentagon with two of its edges off. */
+    reset(); glPolygonMode(GL_FRONT_AND_BACK, GL_LINE); glColor3ub(250, 200, 50);
+    glBegin(GL_TRIANGLES);
+    glEdgeFlag(GL_TRUE); glVertex2f(10, 10); glVertex2f(60, 10); glEdgeFlag(GL_FALSE); glVertex2f(60, 60);
+    glEdgeFlag(GL_TRUE); glVertex2f(60, 60); glVertex2f(10, 60); glEdgeFlag(GL_FALSE); glVertex2f(10, 10);
+    glEnd();
+    glColor3ub(60, 200, 250);
+    glBegin(GL_POLYGON);
+    glEdgeFlag(GL_TRUE); glVertex2f(90, 70); glEdgeFlag(GL_FALSE); glVertex2f(120, 90); glEdgeFlag(GL_TRUE); glVertex2f(110, 122);
+    glVertex2f(70, 122); glEdgeFlag(GL_FALSE); glVertex2f(60, 90);
+    glEnd();
+    glEdgeFlag(GL_TRUE);
 }
 
 static void s_polygon_stipple(void)
@@ -436,6 +487,211 @@ static void s_copy_texture(void)
     glDisable(GL_TEXTURE_2D); glDeleteTextures(1, &id);
 }
 
+/* Texture formats: the same pseudo-random bytes go to both renderers in one internal format, format and type and are
+ * drawn texel for texel (nearest, replace): an 8 x 8 texture on 64 x 64 pixels, a rectangle texture of 12 x 10 texels.
+ * rep 4: bytes n * 17; rep 5: 5 bits replicated, every fourth byte (alpha) 0 or 255; rep 55: 5 bits replicated in every
+ * byte. Then a renderer that stores 4 or 5 bits keeps every value, and both images can match. */
+#ifndef GL_UNPACK_CLIENT_STORAGE_APPLE
+#define GL_UNPACK_CLIENT_STORAGE_APPLE 0x85B2
+#endif
+#ifndef GL_TEXTURE_STORAGE_HINT_APPLE
+#define GL_TEXTURE_STORAGE_HINT_APPLE 0x85BC
+#define GL_STORAGE_SHARED_APPLE 0x85BF
+#endif
+#ifndef GL_TEXTURE_RECTANGLE_EXT
+#define GL_TEXTURE_RECTANGLE_EXT 0x84F5
+#endif
+#ifndef GL_YCBCR_422_APPLE
+#define GL_YCBCR_422_APPLE 0x85B9
+#define GL_UNSIGNED_SHORT_8_8_APPLE 0x85BA
+#define GL_UNSIGNED_SHORT_8_8_REV_APPLE 0x85BB
+#endif
+#ifndef GL_COMPRESSED_RGB_S3TC_DXT1_EXT
+#define GL_COMPRESSED_RGB_S3TC_DXT1_EXT 0x83F0
+#define GL_COMPRESSED_RGBA_S3TC_DXT1_EXT 0x83F1
+#define GL_COMPRESSED_RGBA_S3TC_DXT3_EXT 0x83F2
+#define GL_COMPRESSED_RGBA_S3TC_DXT5_EXT 0x83F3
+#endif
+#define T2 GL_TEXTURE_2D
+#define TR GL_TEXTURE_RECTANGLE_EXT
+#define S3TC "GL_EXT_texture_compression_s3tc"
+typedef struct { const char *id; GLenum target, internal, format, type; int csize, rep, storage, tol; const char *needs; int pairs; } Fmt;
+static const Fmt fmts[] = {
+    /* generic internal formats: the driver may keep the type's layout where the card has one */
+    { "format.rgba-4444", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4, 0, 0, 0, 2, NULL },
+    { "format.rgba-4444rev", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_SHORT_4_4_4_4_REV, 0, 0, 0, 2, NULL },
+    { "format.bgra-4444", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_SHORT_4_4_4_4, 0, 0, 0, 2, NULL },
+    { "format.bgra-4444rev", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_SHORT_4_4_4_4_REV, 0, 0, 0, 2, NULL },
+    { "format.rgba-5551", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_SHORT_5_5_5_1, 0, 0, 0, 2, NULL, 1 },
+    { "format.bgra-5551", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_SHORT_5_5_5_1, 0, 0, 0, 2, NULL },
+    { "format.rgba-1555rev", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, 0, 0, 0, 2, NULL },
+    { "format.bgra-1555rev", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, 0, 0, 0, 2, NULL },
+    { "format.rgb-565", T2, GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, 0, 0, 0, 2, NULL },
+    { "format.rgb-565rev", T2, GL_RGB, GL_RGB, GL_UNSIGNED_SHORT_5_6_5_REV, 0, 0, 0, 2, NULL },
+    { "format.rgba-8888", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8, 0, 0, 0, 1, NULL },
+    { "format.rgba-8888rev", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_INT_8_8_8_8_REV, 0, 0, 0, 1, NULL },
+    { "format.bgra-8888", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8, 0, 0, 0, 1, NULL },
+    { "format.bgra-8888rev", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, 0, 0, 0, 1, NULL },
+    { "format.bgra-ubyte", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.rgb-ubyte", T2, GL_RGB, GL_RGB, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.bgr-ubyte", T2, GL_RGB, GL_BGR, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.rgba-1010102", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_INT_10_10_10_2, 0, 0, 0, 2, NULL },
+    { "format.rgba-2101010rev", T2, GL_RGBA, GL_RGBA, GL_UNSIGNED_INT_2_10_10_10_REV, 0, 0, 0, 2, NULL },
+    { "format.bgra-2101010rev", T2, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_2_10_10_10_REV, 0, 0, 0, 2, NULL },
+    { "format.rgb-332", T2, GL_RGB, GL_RGB, GL_UNSIGNED_BYTE_3_3_2, 0, 0, 0, 2, NULL },
+    { "format.rgb-233rev", T2, GL_RGB, GL_RGB, GL_UNSIGNED_BYTE_2_3_3_REV, 0, 0, 0, 2, NULL },
+    /* sized internal formats, data of the same precision */
+    { "format.rgba4", T2, GL_RGBA4, GL_BGRA, GL_UNSIGNED_SHORT_4_4_4_4_REV, 0, 0, 0, 2, NULL },
+    { "format.rgb5-a1", T2, GL_RGB5_A1, GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, 0, 0, 0, 2, NULL },
+    { "format.rgb5", T2, GL_RGB5, GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, 0, 0, 0, 2, NULL },
+    { "format.r3-g3-b2", T2, GL_R3_G3_B2, GL_RGB, GL_UNSIGNED_BYTE_3_3_2, 0, 0, 0, 2, NULL },
+    { "format.rgb10-a2", T2, GL_RGB10_A2, GL_BGRA, GL_UNSIGNED_INT_2_10_10_10_REV, 0, 0, 0, 2, NULL },
+    { "format.rgba16", T2, GL_RGBA16, GL_RGBA, GL_UNSIGNED_SHORT, 0, 0, 0, 2, NULL },
+    /* sized internal formats from bytes, converted by the driver (the "16-bit textures" of games) */
+    { "format.rgba4-from-ubyte", T2, GL_RGBA4, GL_RGBA, GL_UNSIGNED_BYTE, 0, 4, 0, 2, NULL },
+    { "format.rgb5-a1-from-ubyte", T2, GL_RGB5_A1, GL_RGBA, GL_UNSIGNED_BYTE, 0, 5, 0, 2, NULL, 1 },
+    { "format.rgb5-from-ubyte", T2, GL_RGB5, GL_RGB, GL_UNSIGNED_BYTE, 0, 55, 0, 2, NULL },
+    /* luminance, alpha, intensity */
+    { "format.luminance8", T2, GL_LUMINANCE8, GL_LUMINANCE, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.alpha8", T2, GL_ALPHA8, GL_ALPHA, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.intensity8", T2, GL_INTENSITY8, GL_LUMINANCE, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.luminance8-alpha8", T2, GL_LUMINANCE8_ALPHA8, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, 0, 0, 0, 1, NULL },
+    { "format.luminance4-alpha4", T2, GL_LUMINANCE4_ALPHA4, GL_LUMINANCE_ALPHA, GL_UNSIGNED_BYTE, 0, 4, 0, 2, NULL },
+    { "format.luminance16", T2, GL_LUMINANCE16, GL_LUMINANCE, GL_UNSIGNED_SHORT, 0, 0, 0, 2, NULL },
+    /* compressed: any bytes are valid blocks */
+    { "format.dxt1-rgb", T2, GL_COMPRESSED_RGB_S3TC_DXT1_EXT, 0, 0, 32, 0, 0, 3, S3TC },
+    { "format.dxt1-rgba", T2, GL_COMPRESSED_RGBA_S3TC_DXT1_EXT, 0, 0, 32, 0, 0, 3, S3TC },
+    { "format.dxt3", T2, GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, 0, 0, 64, 0, 0, 3, S3TC },
+    { "format.dxt5", T2, GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, 0, 0, 64, 0, 0, 3, S3TC },
+    /* video */
+    { "format.ycbcr", T2, GL_RGB, GL_YCBCR_422_APPLE, GL_UNSIGNED_SHORT_8_8_APPLE, 0, 0, 0, 4, "GL_APPLE_ycbcr_422" },
+    { "format.ycbcr-rev", T2, GL_RGB, GL_YCBCR_422_APPLE, GL_UNSIGNED_SHORT_8_8_REV_APPLE, 0, 0, 0, 4, "GL_APPLE_ycbcr_422" },
+    /* rectangle textures as Quartz Extreme and video use them; storage 1: in the program's memory (AGP) */
+    { "format.rect-bgra-8888rev", TR, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, 0, 0, 0, 1, "GL_EXT_texture_rectangle" },
+    { "format.rect-bgra-1555rev", TR, GL_RGBA, GL_BGRA, GL_UNSIGNED_SHORT_1_5_5_5_REV, 0, 0, 0, 2, "GL_EXT_texture_rectangle" },
+    { "format.rect-client-storage", TR, GL_RGBA, GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV, 0, 0, 1, 1, "GL_APPLE_client_storage" },
+    { "format.rect-ycbcr-client-storage", TR, GL_RGB, GL_YCBCR_422_APPLE, GL_UNSIGNED_SHORT_8_8_REV_APPLE, 0, 0, 1, 4, "GL_APPLE_ycbcr_422" },
+};
+static int has_extension(const char *name);
+static int arg;                               /* the format a format case draws: index into fmts */
+static unsigned char data[16 * 16 * 4];        /* its texels, as uploaded */
+static void s_format(void)
+{
+    const Fmt *f = &fmts[arg];
+    int rect = f->target == TR, w = rect ? 12 : 8, h = rect ? 10 : 8;
+    unsigned seed = 7919u * (unsigned)(arg + 1), i, v; GLuint id;
+    for (i = 0; i < sizeof data; i++) {
+        seed = seed * 1664525u + 1013904223u; v = seed >> 24;
+        if (f->rep == 4) v = (v >> 4) * 17;
+        else if (f->rep == 5 && i % 4 == 3) v = v & 1 ? 255 : 0;
+        else if (f->rep == 5 || f->rep == 55) v = (v & 0xf8) | v >> 5;
+        data[i] = (unsigned char)v;
+    }
+    reset();
+    glGenTextures(1, &id); glBindTexture(f->target, id);
+    glTexParameteri(f->target, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(f->target, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    if (f->storage) {
+        glPixelStorei(GL_UNPACK_CLIENT_STORAGE_APPLE, GL_TRUE);
+        if (has_extension("GL_APPLE_texture_range")) glTexParameteri(f->target, GL_TEXTURE_STORAGE_HINT_APPLE, GL_STORAGE_SHARED_APPLE);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    if (f->csize) glCompressedTexImage2D(f->target, 0, f->internal, w, h, 0, f->csize, data);
+    else glTexImage2D(f->target, 0, f->internal, w, h, 0, f->format, f->type, data);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4); glPixelStorei(GL_UNPACK_CLIENT_STORAGE_APPLE, GL_FALSE);
+    glEnable(f->target); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    if (rect) textured_quad(16, 24, 112, 104, 0, 0, (float)w, (float)h);   /* rectangle: texel coordinates, 8 pixels a texel */
+    else textured_quad(32, 32, 96, 96, 0, 0, 1, 1);
+    glDisable(f->target); glDeleteTextures(1, &id);
+}
+
+/* pairs: Tiger's libGLImage converts these to ARGB1555 two texels at a time (lwz; rlwinm 15,0,16; rlwinm 31,1,31; and
+ * 0x80008000; or; stw), and the shift right leaves the first texel's alpha in the second's alpha bit: on a real Mac the
+ * second texel's alpha is its own OR the first's. Apple's software renderer does not take that path, so its image gets
+ * the same OR before the comparison. */
+static void pair_alpha(unsigned char *sw)
+{
+    int tx, ty, x, y;
+    for (ty = 0; ty < 8; ty++) for (tx = 1; tx < 8; tx += 2) {
+        int a = sw[((32 + ty * 8 + 4) * W + 32 + (tx - 1) * 8 + 4) * 4 + 3];
+        if (a < 128) continue;
+        for (y = 32 + ty * 8; y < 40 + ty * 8; y++) for (x = 32 + tx * 8; x < 40 + tx * 8; x++) sw[(y * W + x) * 4 + 3] = 255;
+    }
+}
+
+/* A failed format case: the first texels whose colours differ, with their bytes as uploaded. */
+static void explain_format(int index, int tol)
+{
+    const Fmt *f = &fmts[index];
+    int rect = f->target == TR, w = rect ? 12 : 8, h = rect ? 10 : 8, x0 = rect ? 16 : 32, y0 = rect ? 24 : 32, tx, ty, c, shown = 0;
+    int comps = f->format == GL_RGBA || f->format == GL_BGRA ? 4 : f->format == GL_RGB || f->format == GL_BGR ? 3 : f->format == GL_LUMINANCE_ALPHA ? 2 : 1;
+    int bytes = f->csize ? 0 : f->type == GL_UNSIGNED_BYTE ? comps : f->type == GL_UNSIGNED_SHORT ? 2 * comps :
+        f->type == GL_UNSIGNED_BYTE_3_3_2 || f->type == GL_UNSIGNED_BYTE_2_3_3_REV ? 1 :
+        f->type == GL_UNSIGNED_INT_8_8_8_8 || f->type == GL_UNSIGNED_INT_8_8_8_8_REV || f->type == GL_UNSIGNED_INT_10_10_10_2 ||
+        f->type == GL_UNSIGNED_INT_2_10_10_10_REV ? 4 : 2;
+    for (ty = 0; ty < h && shown < 6; ty++) for (tx = 0; tx < w && shown < 6; tx++) {
+        int px = x0 + tx * 8 + 4, py = y0 + ty * 8 + 4, bad = 0;
+        const unsigned char *a = img[0] + (py * W + px) * 4, *b = img[1] + (py * W + px) * 4;
+        for (c = 0; c < 4; c++) bad |= abs(a[c] - b[c]) > tol;
+        if (!bad) continue;
+        printf("  texel %d,%d bytes", tx, ty);
+        for (c = 0; c < bytes; c++) printf(" %02x", data[(ty * w + tx) * bytes + c]);
+        printf(" ati %d %d %d %d sw %d %d %d %d\n", a[0], a[1], a[2], a[3], b[0], b[1], b[2], b[3]); shown++;
+    }
+}
+
+/* Mip levels: each level one colour (distinct in every channel), each drawn by a 32-pixel quad at 2^(k + 0.25) texels
+ * per pixel, which selects level k. DXT: solid blocks where the renderer has S3TC, elsewhere (Apple's software renderer)
+ * the same colours after a DXT colour's 5-6-5 rounding. 256 x 256: large enough for the driver to tile it. */
+typedef struct { const char *id; GLenum internal, format; int w, h, block, tol; } Mip;   /* block: DXT block bytes, 0: none */
+static const Mip mips[] = {
+    { "texture.mip-rgba8", GL_RGBA8, GL_RGBA, 64, 64, 0, 1 },
+    { "texture.mip-rgba8-wide", GL_RGBA8, GL_RGBA, 64, 16, 0, 1 },
+    { "texture.mip-rgba8-256", GL_RGBA8, GL_RGBA, 256, 256, 0, 1 },
+    { "texture.mip-rgb5", GL_RGB5, GL_RGBA, 64, 64, 0, 9 },
+    { "texture.mip-luminance8", GL_LUMINANCE8, GL_LUMINANCE, 64, 64, 0, 1 },
+    { "texture.mip-dxt1", GL_COMPRESSED_RGB_S3TC_DXT1_EXT, 0, 64, 64, 8, 2 },
+    { "texture.mip-dxt1-wide", GL_COMPRESSED_RGB_S3TC_DXT1_EXT, 0, 64, 16, 8, 2 },
+    { "texture.mip-dxt1-256", GL_COMPRESSED_RGB_S3TC_DXT1_EXT, 0, 256, 256, 8, 2 },
+    { "texture.mip-dxt3", GL_COMPRESSED_RGBA_S3TC_DXT3_EXT, 0, 64, 64, 16, 2 },
+    { "texture.mip-dxt5", GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, 0, 64, 64, 16, 2 },
+    { "texture.mip-dxt5-wide", GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, 0, 64, 16, 16, 2 },
+};
+static int mip_arg;   /* the mip case drawn: index into mips */
+static void s_mip(void)
+{
+    static unsigned char t[256 * 256 * 4];
+    const Mip *m = &mips[mip_arg];
+    int s3tc = m->block && has_extension(S3TC), level, w, h, i; GLuint id;
+    reset();
+    glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    for (level = 0, w = m->w, h = m->h; ; level++, w = w > 1 ? w / 2 : 1, h = h > 1 ? h / 2 : 1) {
+        unsigned char q[3] = { (unsigned char)(20 + 26 * level), (unsigned char)(228 - 26 * level), level & 1 ? 220 : 50 }, c[4] = { q[0], q[1], q[2], 255 };
+        if (m->block) { c[0] = (q[0] & 0xf8) | q[0] >> 5; c[1] = (q[1] & 0xfc) | q[1] >> 6; c[2] = (q[2] & 0xf8) | q[2] >> 5; }
+        if (s3tc) {
+            int blocks = ((w + 3) / 4) * ((h + 3) / 4), e = m->block - 8; unsigned v = (unsigned)(q[0] >> 3) << 11 | (unsigned)(q[1] >> 2) << 5 | q[2] >> 3;
+            for (i = 0; i < blocks; i++) {
+                unsigned char *b = t + i * m->block; memset(b, 0, m->block);
+                if (e) { if (m->internal == GL_COMPRESSED_RGBA_S3TC_DXT3_EXT) memset(b, 0xff, 8); else b[0] = b[1] = 255; }   /* alpha 1 */
+                b[e] = b[e + 2] = (unsigned char)v; b[e + 1] = b[e + 3] = (unsigned char)(v >> 8);   /* both colours v, every index 0 */
+            }
+            glCompressedTexImage2D(GL_TEXTURE_2D, level, m->internal, w, h, 0, blocks * m->block, t);
+        } else {
+            int n = m->format == GL_LUMINANCE ? 1 : 4;
+            for (i = 0; i < w * h; i++) memcpy(t + i * n, c, n);
+            glTexImage2D(GL_TEXTURE_2D, level, m->block ? GL_RGBA8 : m->internal, w, h, 0, m->block ? GL_RGBA : m->format, GL_UNSIGNED_BYTE, t);
+        }
+        if (w == 1 && h == 1) break;
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glEnable(GL_TEXTURE_2D); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    for (i = 0; i <= level; i++) {
+        float r = 1.189207f * (float)(1 << i) * 32 / (float)m->w, x0 = (float)(i % 4) * 32, y0 = (float)(i / 4) * 32;
+        textured_quad(x0, y0, x0 + 32, y0 + 32, 0, 0, r, r);
+    }
+    glDisable(GL_TEXTURE_2D); glDeleteTextures(1, &id);
+}
+
 /* ---- Cases ---- */
 
 /* Expected images drawn on the CPU, for features Apple's software renderer does not have (per-vertex point size from a
@@ -473,8 +729,17 @@ static void expect_border(unsigned char *out)
     }
 }
 static void expect_sprite(unsigned char *out) { expect_dots(out, 1); }
+static void expect_unbound(unsigned char *out)
+{
+    int x, y;
+    for (y = 0; y < H; y++) for (x = 0; x < W; x++) {
+        unsigned char *p = out + (y * W + x) * 4; int in = x >= 32 && x < 96 && y >= 32 && y < 96;
+        p[0] = in ? 0 : 26; p[1] = in ? 0 : 51; p[2] = in ? 0 : 77; p[3] = 255;
+    }
+}
 
-typedef struct { const char *id; void (*draw)(void); int tol; unsigned allow; int depth; const char *needs; void (*expect)(unsigned char *); } Case;
+typedef struct { const char *id; void (*draw)(void); int tol; unsigned allow; int depth; const char *needs; void (*expect)(unsigned char *);
+                 void (*fixup)(unsigned char *); } Case;   /* fixup: applied to the software image before the comparison */
 static const Case cases[] = {
     { "readback.clear", s_clear, 0, 0, 0, NULL },
     { "readback.clear-alpha", s_clear_alpha, 1, 0, 0, NULL },
@@ -502,6 +767,10 @@ static const Case cases[] = {
     { "polygon.mode-line", s_polygon_line, 3, 0, 0, NULL },
     { "polygon.mode-point", s_polygon_point, 3, 0, 0, NULL },
     { "polygon.mode-front-line", s_polygon_front_line, 3, 0, 0, NULL },
+    { "polygon.mode-line-quads", s_polygon_line_quads, 3, 0, 0, NULL },
+    { "polygon.mode-line-cull", s_polygon_line_cull, 3, 0, 0, NULL },
+    { "polygon.edge-flags", s_polygon_edge_flags, 3, 0, 0, NULL },
+    { "program.unbound-texture", s_program_unbound_texture, 1, 0, 0, "GL_ARB_fragment_program", expect_unbound },
     { "polygon.stipple", s_polygon_stipple, 0, 0, 0, NULL },
     { "logic.xor", s_logic_xor, 0, 0, 0, NULL },
     { "logic.and", s_logic_and, 0, 0, 0, NULL },
@@ -642,40 +911,164 @@ static void msaa(void)
     CGDisplayRelease(display);
 }
 
+/* --upload: a format case's texture at 512 x 512, uploaded again and drawn in the accelerated context until SECONDS
+ * pass, so the driver's conversion of the texels is the hottest guest code (PT_PROF). */
+static void upload_loop(const char *id, int seconds)
+{
+    static unsigned char big[512 * 512 * 8];
+    int i, k = -1, n = 0; unsigned seed = 1, v; GLuint tex; time_t end;
+    for (i = 0; i < (int)(sizeof fmts / sizeof fmts[0]); i++) if (!strcmp(fmts[i].id, id)) k = i;
+    if (k < 0 || fmts[k].csize || fmts[k].target != T2) { printf("upload: no uncompressed 2D format case %s\n", id); return; }
+    for (i = 0; i < (int)sizeof big; i++) {
+        seed = seed * 1664525u + 1013904223u; v = seed >> 24;
+        if (fmts[k].rep == 4) v = (v >> 4) * 17;
+        else if (fmts[k].rep == 5 && i % 4 == 3) v = v & 1 ? 255 : 0;
+        else if (fmts[k].rep == 5 || fmts[k].rep == 55) v = (v & 0xf8) | v >> 5;
+        big[i] = (unsigned char)v;
+    }
+    CGLSetCurrentContext(ctx[0]); reset();
+    glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, fmts[k].internal, 512, 512, 0, fmts[k].format, fmts[k].type, big);
+    glEnable(GL_TEXTURE_2D); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+    end = time(NULL) + seconds;
+    while (time(NULL) < end) {
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 512, 512, fmts[k].format, fmts[k].type, big);
+        textured_quad(0, 0, 8, 8, 0, 0, 1, 1); glFinish(); n++;
+    }
+    printf("upload %s: %d uploads of 512 x 512 in %d s, error 0x%x\n", id, n, seconds, (unsigned)glGetError());
+}
+
+/* --alpha: RGBA bytes (5 bits replicated, alpha 0 or 255) as GL_RGB5_A1 textures of several widths by 8 rows, drawn
+ * texel for texel and read back; each texel against its own bytes (colour within 1, alpha exact), even and odd columns
+ * counted apart: Tiger's conversion to 1555 can pack two texels at a time. */
+static void alpha_check(void)
+{
+    static const int widths[] = { 4, 8, 12, 16, 24, 32, 64, 128, 512 };
+    static unsigned char src[512 * 8 * 4], out[128 * 8 * 4];
+    int w, i, x, y, c, bad[2], shown; unsigned seed = 99, v; GLuint tex;
+    for (i = 0; i < (int)sizeof src; i++) {
+        seed = seed * 1664525u + 1013904223u; v = seed >> 24;
+        src[i] = (unsigned char)(i % 4 == 3 ? (v & 1 ? 255 : 0) : (v & 0xf8) | v >> 5);
+    }
+    CGLSetCurrentContext(ctx[0]);
+    for (w = 0; w < (int)(sizeof widths / sizeof widths[0]); w++) {
+        int width = widths[w], cols = width < 128 ? width : 128;
+        reset(); glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB5_A1, width, 8, 0, GL_RGBA, GL_UNSIGNED_BYTE, src);
+        glEnable(GL_TEXTURE_2D); glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
+        textured_quad(0, 0, (float)cols, 8, 0, 0, (float)cols / width, 1);
+        glFinish(); glPixelStorei(GL_PACK_ALIGNMENT, 1); glReadPixels(0, 0, cols, 8, GL_RGBA, GL_UNSIGNED_BYTE, out);
+        bad[0] = bad[1] = 0; shown = 0;
+        for (y = 0; y < 8; y++) for (x = 0; x < cols; x++) {
+            const unsigned char *s = src + (y * width + x) * 4, *o = out + (y * cols + x) * 4; int e = o[3] != s[3];
+            for (c = 0; c < 3; c++) e |= abs(o[c] - s[c]) > 1;
+            if (!e) continue;
+            bad[x & 1]++;
+            if (shown++ < 3) printf("  width %d texel %d,%d bytes %02x %02x %02x %02x read %02x %02x %02x %02x\n", width, x, y, s[0], s[1], s[2], s[3], o[0], o[1], o[2], o[3]);
+        }
+        printf("alpha width %d: %d texels, %d in even and %d in odd columns differ, error 0x%x\n", width, cols * 8, bad[0], bad[1], (unsigned)glGetError());
+        glDeleteTextures(1, &tex);
+    }
+}
+
+/* --layout: mipmapped textures whose texels (blocks) carry their own position and level, each drawn once in the
+ * accelerated context, for the engine's OPTICS_TEXTURE_DUMP: 8888, 565, 8-bit luminance, DXT1, DXT5 at 64 x 64,
+ * 256 x 256 and 64 x 16. 8888: x, y, level, 0x5a; 565: x | y << 6 | level << 12; luminance: x + 7y + 50 level;
+ * blocks: x, y, level, 0x5a, then 0xa4, 0xa5, ... */
+static void layout_textures(void)
+{
+    static const struct { GLenum internal, format, type; int bytes, block; } f[] = {
+        { GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, 4, 0 }, { GL_RGB5, GL_RGB, GL_UNSIGNED_SHORT_5_6_5, 2, 0 },
+        { GL_LUMINANCE8, GL_LUMINANCE, GL_UNSIGNED_BYTE, 1, 0 }, { GL_COMPRESSED_RGB_S3TC_DXT1_EXT, 0, 0, 8, 1 },
+        { GL_COMPRESSED_RGBA_S3TC_DXT5_EXT, 0, 0, 16, 1 } };
+    static const int size[3][2] = { {64, 64}, {256, 256}, {64, 16} };
+    static unsigned char t[256 * 256 * 4];
+    int i, j, level, w, h, x, y, k;
+    CGLSetCurrentContext(ctx[0]);
+    for (i = 0; i < 5; i++) for (j = 0; j < 3; j++) {
+        GLuint id; reset();
+        glGenTextures(1, &id); glBindTexture(GL_TEXTURE_2D, id); glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        for (level = 0, w = size[j][0], h = size[j][1]; ; level++, w = w > 1 ? w / 2 : 1, h = h > 1 ? h / 2 : 1) {
+            if (f[i].block) {
+                int bw = (w + 3) / 4, bh = (h + 3) / 4;
+                for (y = 0; y < bh; y++) for (x = 0; x < bw; x++) { unsigned char *b = t + (y * bw + x) * f[i].bytes;
+                    for (k = 0; k < f[i].bytes; k++) b[k] = (unsigned char)(0xa0 + k);
+                    b[0] = (unsigned char)x; b[1] = (unsigned char)y; b[2] = (unsigned char)level; b[3] = 0x5a; }
+                glCompressedTexImage2D(GL_TEXTURE_2D, level, f[i].internal, w, h, 0, bw * bh * f[i].bytes, t);
+            } else {
+                for (y = 0; y < h; y++) for (x = 0; x < w; x++) { unsigned char *p = t + (y * w + x) * f[i].bytes;
+                    if (f[i].bytes == 4) { p[0] = (unsigned char)x; p[1] = (unsigned char)y; p[2] = (unsigned char)level; p[3] = 0x5a; }
+                    else if (f[i].bytes == 2) { unsigned v = (unsigned)(x & 63) | (unsigned)(y & 63) << 6 | (unsigned)level << 12; p[0] = (unsigned char)(v >> 8); p[1] = (unsigned char)v; }
+                    else p[0] = (unsigned char)(x + 7 * y + 50 * level); }
+                glTexImage2D(GL_TEXTURE_2D, level, f[i].internal, w, h, 0, f[i].format, f[i].type, t);
+            }
+            if (w == 1 && h == 1) break;
+        }
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST_MIPMAP_NEAREST); glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glEnable(GL_TEXTURE_2D); textured_quad(0, 0, 64, 64, 0, 0, 1, 1); glDisable(GL_TEXTURE_2D); glFinish();
+        printf("layout %d x %d format %d drawn\n", size[j][0], size[j][1], i);
+        glDeleteTextures(1, &id);
+    }
+}
+
+/* One case: drawn into both contexts (or into the accelerated one, against its expected image), read back, compared and
+ * printed; 1 if it failed. */
+static int run_case(const Case *c, const char *out)
+{
+    int missing = 0, maxd = 0, k, r; unsigned bad; GLenum error[2];
+    for (r = 0; r < (c->expect ? 1 : 2); r++) { CGLSetCurrentContext(ctx[r]); if (c->needs && !has_extension(c->needs)) missing |= 1 << r; }
+    if (missing) { printf("%s skip %s missing in%s%s\n", c->id, c->needs, missing & 1 ? " accelerated" : "", missing & 2 ? " software" : ""); return 0; }
+    error[1] = 0; if (c->expect) c->expect(img[1]);
+    for (r = 0; r < (c->expect ? 1 : 2); r++) {
+        renderer = r; CGLSetCurrentContext(ctx[r]);
+        c->draw(); glFinish();
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, img[r]);
+        if (c->depth) glReadPixels(0, 0, W, H, GL_DEPTH_COMPONENT, GL_FLOAT, depth[r]);
+        error[r] = glGetError();
+    }
+    if (c->fixup) c->fixup(img[1]);
+    bad = unmatched(img[0], img[1], c->tol, &maxd) + unmatched(img[1], img[0], c->tol, &maxd);
+    if (c->depth) bad += depth_unmatched(depth[0], depth[1]) + depth_unmatched(depth[1], depth[0]);
+    if (c->depth && bad) printf("%s depth ATI/SW at (2,2) %g/%g (64,64) %g/%g (110,110) %g/%g\n", c->id, depth[0][2 * W + 2], depth[1][2 * W + 2],
+        depth[0][64 * W + 64], depth[1][64 * W + 64], depth[0][110 * W + 110], depth[1][110 * W + 110]);
+    k = bad > c->allow || error[0] || error[1];
+    printf("%s %s unmatched=%u maxdiff=%d lit=%u/%u", c->id, k ? "FAIL" : "pass", bad, maxd, lit(img[0]), lit(img[1]));
+    if (error[0] || error[1]) printf(" glerror=0x%x/0x%x", (unsigned)error[0], (unsigned)error[1]);
+    if (k) { int m[4] = { 0, 0, 0, 0 }, j, ch;
+        for (j = 0; j < W * H; j++) for (ch = 0; ch < 4; ch++) { int e = abs(img[0][j * 4 + ch] - img[1][j * 4 + ch]); if (e > m[ch]) m[ch] = e; }
+        printf(" channels=%d/%d/%d/%d", m[0], m[1], m[2], m[3]); }
+    putchar('\n'); fflush(stdout);
+    if (out) { ppm(out, c->id, "ati", img[0]); ppm(out, c->id, "sw", img[1]); }
+    return k;
+}
+
 int main(int argc, char **argv)
 {
-    const char *out = NULL; int first = 1, failures = 0, i, k, r;
+    const char *out = NULL; int first = 1, failures = 0, nc = (int)(sizeof cases / sizeof cases[0]), i, k, r;
+    int nf = (int)(sizeof fmts / sizeof fmts[0]), nm = (int)(sizeof mips / sizeof mips[0]);
     if (argc > 2 && !strcmp(argv[1], "--out")) { out = argv[2]; first = 3; }
     if (!make_contexts()) return 2;
-    if (argc > 1 && !strcmp(argv[1], "--gpu-state")) { gpu_state(); return 0; }
-    if (argc > 1 && !strcmp(argv[1], "--msaa")) { msaa(); return 0; }
+    if (argc > first && !strcmp(argv[first], "--gpu-state")) { gpu_state(); return 0; }
+    if (argc > first && !strcmp(argv[first], "--msaa")) { msaa(); return 0; }
+    if (argc > first + 2 && !strcmp(argv[first], "--upload")) { upload_loop(argv[first + 1], atoi(argv[first + 2])); return 0; }
+    if (argc > first && !strcmp(argv[first], "--alpha")) { alpha_check(); return 0; }
+    if (argc > first && !strcmp(argv[first], "--layout")) { layout_textures(); return 0; }
     for (r = 0; r < 2; r++) { CGLSetCurrentContext(ctx[r]); printf("renderer %d: %s | %s\n", r, (const char *)glGetString(GL_RENDERER), (const char *)glGetString(GL_VERSION)); }
     CGLSetCurrentContext(ctx[0]); printf("extensions 0: %s\n", (const char *)glGetString(GL_EXTENSIONS));
-    for (i = 0; i < (int)(sizeof cases / sizeof cases[0]); i++) {
-        const Case *c = &cases[i]; int selected = first >= argc, missing = 0, maxd = 0; unsigned bad; GLenum error[2];
+    for (i = 0; i < nc + nf + nm; i++) {
+        Case f; const Case *c = &f; int selected = first >= argc;
+        memset(&f, 0, sizeof f);
+        if (i < nc) c = &cases[i];
+        else if (i < nc + nf) { f.id = fmts[i - nc].id; f.draw = s_format; f.tol = fmts[i - nc].tol; f.needs = fmts[i - nc].needs; f.fixup = fmts[i - nc].pairs ? pair_alpha : NULL; arg = i - nc; }
+        else { f.id = mips[i - nc - nf].id; f.draw = s_mip; f.tol = mips[i - nc - nf].tol; mip_arg = i - nc - nf; }
         for (k = first; k < argc; k++) if (!strncmp(c->id, argv[k], strlen(argv[k]))) selected = 1;
-        if (!selected) continue;
-        for (r = 0; r < (c->expect ? 1 : 2); r++) { CGLSetCurrentContext(ctx[r]); if (c->needs && !has_extension(c->needs)) missing |= 1 << r; }
-        if (missing) { printf("%s skip %s missing in%s%s\n", c->id, c->needs, missing & 1 ? " accelerated" : "", missing & 2 ? " software" : ""); continue; }
-        error[1] = 0; if (c->expect) c->expect(img[1]);
-        for (r = 0; r < (c->expect ? 1 : 2); r++) {
-            renderer = r; CGLSetCurrentContext(ctx[r]);
-            c->draw(); glFinish();
-            glPixelStorei(GL_PACK_ALIGNMENT, 1);
-            glReadPixels(0, 0, W, H, GL_RGBA, GL_UNSIGNED_BYTE, img[r]);
-            if (c->depth) glReadPixels(0, 0, W, H, GL_DEPTH_COMPONENT, GL_FLOAT, depth[r]);
-            error[r] = glGetError();
-        }
-        bad = unmatched(img[0], img[1], c->tol, &maxd) + unmatched(img[1], img[0], c->tol, &maxd);
-        if (c->depth) bad += depth_unmatched(depth[0], depth[1]) + depth_unmatched(depth[1], depth[0]);
-        if (c->depth && bad) printf("%s depth ATI/SW at (2,2) %g/%g (64,64) %g/%g (110,110) %g/%g\n", c->id, depth[0][2 * W + 2], depth[1][2 * W + 2],
-            depth[0][64 * W + 64], depth[1][64 * W + 64], depth[0][110 * W + 110], depth[1][110 * W + 110]);
-        k = bad > c->allow || error[0] || error[1];
-        failures += k;
-        printf("%s %s unmatched=%u maxdiff=%d lit=%u/%u", c->id, k ? "FAIL" : "pass", bad, maxd, lit(img[0]), lit(img[1]));
-        if (error[0] || error[1]) printf(" glerror=0x%x/0x%x", (unsigned)error[0], (unsigned)error[1]);
-        putchar('\n'); fflush(stdout);
-        if (out) { ppm(out, c->id, "ati", img[0]); ppm(out, c->id, "sw", img[1]); }
+        if (selected && run_case(c, out)) { failures++; if (i >= nc && i < nc + nf) explain_format(i - nc, c->tol); }
     }
     printf("failures %d\n", failures);
     return failures > 100 ? 100 : failures;

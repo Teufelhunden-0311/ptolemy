@@ -65,6 +65,9 @@ clang $CF tests/optics-fence.c src/platform.c "$P/frontend.c" "$P/io.c" "$P/guar
 # The CP thread beside the CPU (locking, hand-over, reset in flight, close), under ThreadSanitizer.
 clang $CF -g -fsanitize=thread tests/optics-cp-thread.c src/platform.c "$P/frontend.c" "$P/io.c" "$P/guard.c" "$P/address.c" "$P/timeline.c" "$P/diagnostics.c" "$P/diagnostics_io.c" "$P/draw.c" "$P/ring.c" "$P/command_stream.c" "$P/r300_state.c" "$P/pixel.c" \
     "$P/foundation/pm4.c" "$P/foundation/shader_decode.c" "$P/foundation/shader_eval.c" -o build/test-optics-cp-thread && { TSAN_OPTIONS=halt_on_error=1 build/test-optics-cp-thread 2>build/test-optics-cp-thread.log || { cat build/test-optics-cp-thread.log; exit 1; }; }
+# A draw waiting for its shader (OPTICS_EXEC_BUSY) leaves the device lock free; its compile's completion runs it once.
+clang $CF -g -fsanitize=thread tests/optics-draw-defer.c src/platform.c "$P/frontend.c" "$P/io.c" "$P/guard.c" "$P/address.c" "$P/timeline.c" "$P/diagnostics.c" "$P/diagnostics_io.c" "$P/draw.c" "$P/ring.c" "$P/command_stream.c" "$P/r300_state.c" "$P/pixel.c" \
+    "$P/foundation/pm4.c" "$P/foundation/shader_decode.c" "$P/foundation/shader_eval.c" -o build/test-optics-draw-defer && { TSAN_OPTIONS=halt_on_error=1 build/test-optics-draw-defer 2>build/test-optics-draw-defer.log || { cat build/test-optics-draw-defer.log; exit 1; }; }
 # Fast VRAM on real HVF stage-2 protection; the argument run bypasses the protection (negative control).
 clang $CF tests/optics-guard-hvf.c src/platform.c "$P/frontend.c" "$P/io.c" "$P/guard.c" "$P/address.c" "$P/timeline.c" "$P/diagnostics.c" "$P/diagnostics_io.c" "$P/draw.c" "$P/ring.c" "$P/command_stream.c" "$P/r300_state.c" \
     "$P/pixel.c" "$P/foundation/pm4.c" "$P/foundation/shader_decode.c" "$P/foundation/shader_eval.c" "$P/cpu_access.c" "$P/hvf_access.c" "$P/cpu_guard.c" \

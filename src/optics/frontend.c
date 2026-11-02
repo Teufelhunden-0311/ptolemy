@@ -97,7 +97,8 @@ struct PtRadeon {
     uint8_t *view,*view_state; size_t view_count;
     /* The aperture of the framebuffer and of the view: 0 for 32 bits, 1 for 8 and 16. Tiger's driver sets
      * SURFACE_CNTL to 0x00200001 after every mode switch whatever the depth: aperture 0 swaps 32-bit words, aperture 1
-     * stays linear. Through aperture 0, 8-bit pixels would land mirrored in groups of four. */
+     * stays linear (at 16 bits aperture_xor keeps it swapping). Through aperture 0, 8-bit pixels would land mirrored in
+     * groups of four. */
     unsigned fb_ap;
     /* GPU completion ledger (timeline.c): one sequence per executed GPU job (issued), executor batches submitted and
      * completed against it; deferred guest completions (scratch / SW interrupt writes) wait on its fences, in order. */
@@ -111,14 +112,18 @@ struct PtRadeon {
     uint64_t rate_last,rate_cp,rate_build,rate_exec,rate_prev[4],rate_yields,rate_io[2]; int rate_depth;
     uint64_t rate_slow,rate_slow_lock,rate_slow_own; uint32_t rate_slow_at;   /* OPTICS_RATE: CPU VRAM accesses over 20 us: lock wait, materialize */
     uint64_t zpass; unsigned zpass_draws,zpass_empty; int zpass_open; uint32_t zpass_query;   /* occlusion query: open since ZB_ZPASS_DATA, its id */
+    /* Session log: host time between published new frames (pace), and device entries that waited 10 ms or more for the lock */
+    uint64_t pace_ns,pace_gap,pace_frames,pace_time,pace_max,pace_bucket[7],lock_waits,lock_wait_ns,lock_wait_max;
     /* config.cp_thread: lock guards all of the above; the CP thread holds it while it runs and lets
      * go between packets while want (callers spinning for it) is nonzero. cp_kicked: a WPTR write it has not seen yet;
      * cp_running: inside cp_run; cp_sleeping: waiting on cp_event; cp_progress: packets accepted plus completions published. */
     pthread_mutex_t lock; pthread_t cp; PtEvent cp_event; _Atomic unsigned want;
     int cp_async,cp_quit,cp_kicked,cp_running,cp_sleeping; uint64_t cp_progress;
+    _Atomic int draw_wait;   /* a draw packet waits in the ring for its shader (run_draw), read by compile completions */
     /* Immediate-mode primitive through the VAP vertex registers (vtx_write): VAP_VF_CNTL as written, the current
      * attributes (0x2300..0x24ab), the 16-byte groups written since it began, and the vertices emitted so far. */
     uint32_t imm_cntl,imm_attr[(0x24ac-0x2300)/4]; uint32_t imm_groups; int imm_open; uint32_t *imm_data; size_t imm_words,imm_cap;
+    uint8_t *imm_edge; int imm_edge_seen;   /* each vertex's edge flag (VAP_VTX_EDGE_FLAG when it was emitted); seen: written since the begin */
 };
 
 static OpticsFrameStorage storage;
@@ -127,7 +132,7 @@ void optics_frontend_set_executor(const OpticsExecutor *e) { exec_ops=e?*e:(Opti
 /* Only while the CP waits on a fence: the kick makes a running vCPU leave to the device service promptly, the event
  * wakes an idle one (MSR.POW). No guest interrupt is raised. A CP thread is woken directly. */
 void optics_frontend_wake(PtRadeon *d) {   /* any thread */
-    if(!d || !atomic_load(&d->cp_wait)) return;
+    if(!d || !(atomic_load(&d->cp_wait) || atomic_load(&d->draw_wait))) return;
     if(d->cp_async){ pt_event_signal(&d->cp_event); return; }
     if(d->config.kick) atomic_store(d->config.kick,1u);
     if(d->config.wake) pt_event_signal(d->config.wake);
@@ -145,9 +150,13 @@ static void take(PtRadeon *d) {
     for(unsigned i=0;i<4096;i++){ if(!pthread_mutex_trylock(&d->lock)) return; relax(); }
     pthread_mutex_lock(&d->lock);
 }
+static uint64_t mono_ns(void);
 static void enter(PtRadeon *d) {   /* a device entry point, on any thread but the CP thread */
     if(!d->cp_async) return;
-    atomic_fetch_add_explicit(&d->want,1,memory_order_relaxed); take(d); atomic_fetch_sub_explicit(&d->want,1,memory_order_relaxed);
+    atomic_fetch_add_explicit(&d->want,1,memory_order_relaxed);
+    if(pthread_mutex_trylock(&d->lock)){ uint64_t t=mono_ns(); take(d); t=mono_ns()-t;
+        if(t>=10000000u){ d->lock_waits++; d->lock_wait_ns+=t; if(t>d->lock_wait_max) d->lock_wait_max=t; } }
+    atomic_fetch_sub_explicit(&d->want,1,memory_order_relaxed);
 }
 static void leave(PtRadeon *d) { if(d->cp_async) pthread_mutex_unlock(&d->lock); }
 /* CP thread between two packets: a waiting caller goes first (it decrements want once it holds the lock, so the CP does
@@ -386,6 +395,10 @@ int optics_frontend_gpu_write(PtRadeon *d,uint64_t gpu,const void *buf,size_t n)
 /* CPU aperture byte lanes: 32-bit swap XORs the byte address with 3, 16-bit swap with 1. */
 static unsigned aperture_xor(const PtRadeon *d,int ap1) {
     if(!d->surface_written) return ap1?0:d->boot_swap;
+    /* A 16-bit display through aperture 1 keeps the swap pt_radeon_display_mode gave it: Tiger's driver then writes
+     * SURFACE_CNTL 0x00200001 (aperture 1 linear), which left the CPU's pixels big-endian beside the little-endian ones
+     * its GPU composites (Age of Empires' intro movie in Classic: black as dark green, colours in noise). */
+    if(ap1 && d->fb_ap==1 && ((d->reg[CRTC_GEN_CNTL/4]>>8&7)==3 || (d->reg[CRTC_GEN_CNTL/4]>>8&7)==4)) return 1;
     uint32_t s=d->reg[SURFACE_CNTL/4]>>(ap1?22:20)&3; return s&2?3:s&1?1:0;
 }
 
@@ -425,13 +438,14 @@ static void boot_mode(PtRadeon *d,unsigned w,unsigned h,unsigned bpp,unsigned pi
 }
 static void vbe_mode(PtRadeon *d) { if((d->vbe[4]&1) && d->vbe[1] && d->vbe[2]) boot_mode(d,d->vbe[1],d->vbe[2],d->vbe[3],d->vbe[6]); }
 /* The display NDRV's mode switch and colour table (guest/ndrv/display.c, hypercall ops 3 and 4). The CRTC
- * gets what a driver programs for the mode: geometry, pixel width (8 indexed, 16 = 1555 as Mac OS uses it, 32), pitch
- * rounded up to 64 pixels (Tiger's compositor blits with that pitch), scanout at VRAM 0. The framebuffer's aperture gets the
+ * gets what a driver programs for the mode: geometry, pixel width (8 indexed, 16 = 1555 as Mac OS uses it, 32), rows
+ * of whole 256 bytes (Tiger's ATI driver draws with that pitch: 16 bits at 1472 wide is 1536 pixels; with 64-pixel rows
+ * Age of Empires' intro was sheared 64 pixels a row), scanout at VRAM 0. The framebuffer's aperture gets the
  * byte swap of the depth, so CPU pixels land in the order the scanout reads: aperture 0 for 32 bits, aperture 1 for 8 and
  * 16, which Tiger's driver leaves linear (fb_ap); *fb_offset is its offset in the BAR, the base the NDRV reports. */
 int pt_radeon_display_mode(PtRadeon *d,unsigned w,unsigned h,unsigned depth,uint32_t *fb_offset) {
     if(!d) return EINVAL;
-    unsigned pitch=depth==32 && w==d->config.width && h==d->config.height ? w : (w+63)/64*64;   /* the boot mode keeps its pitch */
+    unsigned pitch=depth==32 && w==d->config.width && h==d->config.height ? w : (w*(depth/8)+255)/256*256/(depth/8);   /* the boot mode keeps its pitch */
     if((depth!=8 && depth!=16 && depth!=32) || w<320 || w>2560 || w%8 || h<200 || h>1600 ||
        (uint64_t)pitch*(depth/8)*h>d->vram_bytes) return EINVAL;
     enter(d);
@@ -501,7 +515,10 @@ static void blit(PtRadeon *d,int cp_rectangle) {
         if(k==n && n<160) { seen[n][0]=soff; seen[n][1]=doff; n++;
             fprintf(stderr,"optics-frontend: 2D %s %#x(%u,%u) -> %#x(%u,%u) %ux%u pitch %u/%u bpp %u\n",copy?"copy":"fill",soff,sx,sy,doff,dx,dy,w,h,spitch,dpitch,bpp); }
     }
-    { FILE *f=reg_log(0); if(f) fprintf(f,"2D %s %#x(%u,%u) -> %#x(%u,%u) %ux%u pitch %u/%u bpp %u gmc %08x dp_cntl %08x%s\n",copy?"copy":"fill",soff,sx,sy,doff,dx,dy,w,h,spitch,dpitch,bpp,gmc,d->reg[0x16c0/4],cp_rectangle?" cp":""); }
+    { FILE *f=reg_log(0); if(f) { fprintf(f,"2D %s %#x(%u,%u) -> %#x(%u,%u) %ux%u pitch %u/%u bpp %u gmc %08x dp_cntl %08x swap %u%s",copy?"copy":"fill",soff,sx,sy,doff,dx,dy,w,h,spitch,dpitch,bpp,gmc,d->reg[0x16c0/4],swap,cp_rectangle?" cp":"");
+        uint8_t first[32]; size_t k=(size_t)w*bpp<sizeof first?(size_t)w*bpp:sizeof first;   /* the first source rows' bytes, as stored */
+        for(uint32_t y=0;copy && y<h && y<4;y++) if(gpu_copy(d,(uint64_t)soff+(uint64_t)(sy+y)*spitch+(uint64_t)sx*bpp,first,k,0)){ fputs(" src",f); for(size_t i=0;i<k;i++) fprintf(f,"%s%02x",i%4?"":" ",first[i]); }
+        fputc('\n',f); } }
     size_t row=(size_t)w*bpp,allocation=cp_rectangle?row*h:row;
     if(allocation>(64u<<20)){blit_refused(d,"2D rectangle snapshot exceeds budget");return;}
     uint8_t *tmp=malloc(allocation); if(!tmp){blit_refused(d,"2D row allocation failed");return;}
@@ -540,7 +557,7 @@ static int optics_ring_execute(void *,const PtR2Pm4Packet *,uint64_t);
 static void rb_setup(PtRadeon *d) {
     unsigned exponent=d->reg[CP_RB_CNTL/4]&0x3f;
     if(d->ring_ready) pt_r2_ring_destroy(&d->ring);
-    d->ring_ready=0; d->ring_stalled=0; d->ring_words=0;
+    d->ring_ready=0; d->ring_stalled=0; d->ring_words=0; d->draw_wait=0;
     d->reg[CP_RB_RPTR/4]=0;
     if(exponent>19) return;
     uint32_t words=1u<<(exponent+1);
@@ -602,23 +619,27 @@ static void zpass_end(PtRadeon *d,uint32_t address) {
     static unsigned shown; if(shown<4 && first && !query_gpu()){ shown++; fprintf(stderr,"optics-frontend: occlusion query: %u pixels (on-screen area, depth not tested) to %#x\n",n,address); }
 }
 /* One register write, from MMIO or from a type-0 packet. 3D-space words also feed the owned state shadow. */
-static int run_draw(PtRadeon *d,uint8_t opcode,const uint32_t *payload,uint32_t words);
+static int run_draw(PtRadeon *d,uint8_t opcode,const uint32_t *payload,uint32_t words,const uint8_t *edge,int defer);
 /* Immediate-mode primitives through the VAP vertex registers: Tiger's driver draws polygons in glPolygonMode line and
  * point modes so (with edge flags). VAP_VF_CNTL written as a register begins one (its primitive type); VAP_VTX_*
  * 0x2300..0x23ff hold the current attributes in 16-byte groups (POS_0 at 0x2300, COLOR_0 at 0x2320: what it writes);
  * POS_0's W (0x230c) emits a vertex of the groups written since the begin, in address order, VAP_VTX_SIZE dwords as an
  * IMMD_2 packet lays them out; VAP_VTX_END_OF_PKT (0x24ac) draws them as that packet would. Unverified beyond Tiger's
- * polygon modes: the layout for other attribute sets. Edge flags (VAP_VTX_EDGE_FLAG 0x245c) are not modelled. */
+ * polygon modes: the layout for other attribute sets. VAP_VTX_EDGE_FLAG (0x245c) written before a vertex is its edge flag
+ * (bit 0), for the polygon modes (draw.h polyline). */
 static void vtx_write(PtRadeon *d,uint32_t a,uint32_t v,int from_cp) {
-    if(a==0x2084){ d->imm_cntl=v; d->imm_open=1; d->imm_groups=0; d->imm_words=0; return; }
+    if(a==0x2084){ d->imm_cntl=v; d->imm_open=1; d->imm_groups=0; d->imm_words=0; d->imm_edge_seen=0; return; }
     if(!d->imm_open) return;
     uint32_t size=d->reg[0x20b4/4]&0x7f;   /* VAP_VTX_SIZE */
     if(a<0x24ac) {
         d->imm_attr[(a-0x2300)/4]=v; if(a<0x2400) d->imm_groups|=1u<<((a-0x2300)/16);
+        if(a==0x245c) d->imm_edge_seen=1;
         if(a!=0x230c) return;
         if(!size || d->imm_words+size>(size_t)65535*size){ d->imm_open=0; return; }
         if(d->imm_words+size>d->imm_cap){ size_t cap=d->imm_cap?d->imm_cap*2:1024; while(cap<d->imm_words+size) cap*=2;
-            uint32_t *p=realloc(d->imm_data,cap*4); if(!p){ d->imm_open=0; return; } d->imm_data=p; d->imm_cap=cap; }
+            uint32_t *p=realloc(d->imm_data,cap*4); if(!p){ d->imm_open=0; return; } d->imm_data=p;
+            uint8_t *e=realloc(d->imm_edge,cap); if(!e){ d->imm_open=0; return; } d->imm_edge=e; d->imm_cap=cap; }
+        d->imm_edge[d->imm_words/size]=(uint8_t)(d->imm_attr[(0x245c-0x2300)/4]&1);
         uint32_t n=0; for(unsigned g=0;g<16 && n<size;g++) if(d->imm_groups>>g&1) for(unsigned c=0;c<4 && n<size;c++) d->imm_data[d->imm_words+n++]=d->imm_attr[4*g+c];
         while(n<size) d->imm_data[d->imm_words+n++]=0;
         d->imm_words+=size; return;
@@ -629,7 +650,7 @@ static void vtx_write(PtRadeon *d,uint32_t a,uint32_t v,int from_cp) {
     uint32_t *payload=malloc((1+(size_t)count*size)*4); if(!payload) return;
     payload[0]=(d->imm_cntl&15)|3u<<4|count<<16;   /* VF_CNTL: its primitive, the vertices in the packet */
     memcpy(payload+1,d->imm_data,(size_t)count*size*4);
-    (void)run_draw(d,0x35,payload,1+count*size); free(payload);
+    (void)run_draw(d,0x35,payload,1+count*size,d->imm_edge_seen?d->imm_edge:NULL,0); free(payload);
 }
 static void reg_write(PtRadeon *d,uint32_t a,uint32_t v,int from_cp) {
     if(a>=REG_BYTES || (a&3)) {d->stats.unknown_writes++;return;}
@@ -876,20 +897,32 @@ static int admit_completion(PtRadeon *d,unsigned writes) {
     d->held=1; d->cp_wait=1; return 1;   /* the whole packet stays in the ring/IB, unexecuted */
 }
 /* One draw: built from the packet payload (IMMD_2/VBUF_2/INDX_2 words) against the register state and run by the
- * executor. 0, or 2 to stop the CP (a GPU failure; OPTICS_STRICT=1 also for a refused draw). */
-static int run_draw(PtRadeon *d,uint8_t opcode,const uint32_t *payload,uint32_t words) {
+ * executor. 0, or 2 to stop the CP (a GPU failure; OPTICS_STRICT=1 also for a refused draw); with defer (a whole draw
+ * packet), 1 while its shader compiles: the packet stays and the CP waits on cp_wait without the lock. */
+static int run_draw(PtRadeon *d,uint8_t opcode,const uint32_t *payload,uint32_t words,const uint8_t *edge,int defer) {
+    if(defer && d->draw_wait && exec_ops.compiling && exec_ops.compiling(d->exec)) return 1;   /* still compiling: no rebuild per wake */
     OpticsDraw draw; const char *why="no draw executor installed";
     /* Vertex arrays: VAP_VTX_NUM_ARRAYS, then per pair VAP_VTX_AOS_ATTR (comps|stride<<8, two halves) and two addresses. */
     OpticsAos aos={0}; aos.count=d->reg[0x20c0/4]&31; if(aos.count>16) aos.count=16;
     for(uint32_t k=0;k<aos.count;k++){uint32_t attr=d->reg[(0x20c4+12*(k/2))/4]>>(16*(k&1));
         aos.array[k].components=attr&0x7f; aos.array[k].stride=attr>>8&0x7f; aos.array[k].offset=d->reg[(0x20c8+12*(k/2)+4*(k&1))/4];
         uint64_t vo; if(optics_frontend_vram_offset(d,aos.array[k].offset,&vo)) aos.local|=1u<<k;}
+    /* glPolygonMode with a mode per face: polygons the build classifies (draw.h polyline) come as the front faces, then
+     * are built again for the back faces */
+    uint32_t pm=d->reg[0x4288/4]; int split=(pm&1) && (pm>>4&7)!=(pm>>7&7);
+    aos.edge=edge; aos.faces=split?1:0;
     uint64_t t0=rate_on()?mono_ns():0;
     int built=payload && optics_draw_build(&draw,d->reg,d->r300,opcode,payload,words,&aos,fetch_gpu,d,&why);
     uint64_t t1=t0?mono_ns():0; d->rate_build+=t1-t0;
     draw.query=d->zpass_open?d->zpass_query:0;
     d->in_executor=1; int result=OPTICS_EXEC_REFUSED;
-    if(built && exec_ops.draw && draw.poly_front!=draw.poly_back && !draw.lines && !draw.sprite) {
+    if(built && exec_ops.draw && draw.polyline && split) {
+        result=exec_ops.draw(d->exec,d,&draw,&why);
+        if(result==OPTICS_EXEC_DONE) { OpticsDraw back; aos.faces=2;
+            if(optics_draw_build(&back,d->reg,d->r300,opcode,payload,words,&aos,fetch_gpu,d,&why)) {
+                back.query=draw.query; result=exec_ops.draw(d->exec,d,&back,&why); optics_draw_free(&back); }
+            else result=OPTICS_EXEC_REFUSED; }
+    } else if(built && exec_ops.draw && draw.poly_front!=draw.poly_back && !draw.lines && !draw.sprite) {
         /* glPolygonMode with different modes per face: the front faces in theirs (back faces culled), then the back
          * faces in theirs. Approximation: a face in point mode beside another mode is drawn as lines. */
         OpticsDraw *back=malloc(sizeof *back);
@@ -899,8 +932,10 @@ static int run_draw(PtRadeon *d,uint8_t opcode,const uint32_t *payload,uint32_t 
             result=exec_ops.draw(d->exec,d,&draw,&why);
             if(result==OPTICS_EXEC_DONE) result=exec_ops.draw(d->exec,d,back,&why);
             free(back); }
-    } else if(built && exec_ops.draw) result=exec_ops.draw(d->exec,d,&draw,&why);
+    } else if(built && exec_ops.draw){ draw.defer=(uint8_t)defer; result=exec_ops.draw(d->exec,d,&draw,&why); }
     d->in_executor=0;
+    if(result==OPTICS_EXEC_BUSY){ if(payload) optics_draw_free(&draw); d->draw_wait=1; return 1; }
+    d->draw_wait=0;
     if(t1) d->rate_exec+=mono_ns()-t1;
     if(result==OPTICS_EXEC_DONE){ (void)optics_frontend_job(d); if(!query_gpu()) zpass_draw(d,&draw); else d->zpass_draws+=d->zpass_open;
         d->stats.approx_mip+=draw.approx&OPTICS_APPROX_MIP?1:0; d->stats.approx_border+=draw.approx&OPTICS_APPROX_BORDER?1:0;
@@ -978,7 +1013,7 @@ static int execute(PtRadeon *d,const PtR2Pm4Packet *p) {
     if(effect==OPTICS_EFFECT_DRAW) {
         uint32_t *payload=malloc((p->words?p->words:1)*4u);
         if(payload) for(uint32_t i=0;i<p->words;i++) pt_r2_pm4_word(p,i,&payload[i]);
-        int r=run_draw(d,p->opcode,payload,p->words); free(payload); return r;
+        int r=run_draw(d,p->opcode,payload,p->words,NULL,1); free(payload); return r;
     }
     d->stats.packets_refused++; d->stats.last_refused_opcode=p->opcode;
     {   static unsigned shown; uint32_t w[3]={0,0,0}; for(uint32_t i=0;i<3 && i<p->words;i++) pt_r2_pm4_word(p,i,&w[i]);
@@ -1033,7 +1068,7 @@ static void cp_run_body(PtRadeon *d,int kicked) {
             if(r==OPTICS_STREAM_BUSY) break;   /* a completion fence is pending: resumes at the same packet */
             if(r==OPTICS_STREAM_BUDGET) continue;
             if(r!=OPTICS_STREAM_EMPTY) {
-                note(d,"IB stream stopped (%u), %u packets",r,n); optics_stream_reset(d->stream);
+                note(d,"IB stream stopped (%u), %u packets",r,n); optics_stream_reset(d->stream); d->draw_wait=0;
                 if(d->stats.failed || strict()){ d->ring_stalled=1; break; }   /* DEGRADED default: the root ring continues */
             }
         }
@@ -1221,6 +1256,13 @@ static int publish_scanout(PtRadeon *d,int force) {
     pthread_mutex_lock(&d->frame_lock);
     r.ticket=(PtGpuTicket){d->epoch,++d->frame_seq}; r.slot=(unsigned)(s-d->slot); s->f=r; s->seq=d->frame_seq;
     pthread_mutex_unlock(&d->frame_lock);
+    /* pace: gaps while frames stream (the one before came within 100 ms); 100 ms or more is a stall the user sees */
+    uint64_t now=mono_ns(),gap=now-d->pace_ns; d->pace_ns=now;
+    if(d->pace_gap && d->pace_gap<100000000u && gap<1000000000u) {
+        static const uint32_t bound[]={20,34,50,100,250,500}; unsigned b=0; while(b<6 && gap>=bound[b]*1000000ull) b++;
+        d->pace_bucket[b]++; d->pace_frames++; d->pace_time+=gap; if(gap>d->pace_max) d->pace_max=gap;
+    }
+    d->pace_gap=gap;
     d->stats.frames++; return 1;
 }
 /* CPU owner, about every millisecond: VBL, a CP waiting on a completion fence (or with packets left by its budget),
@@ -1277,7 +1319,12 @@ static void status_json(PtRadeon *d,FILE *f) {
 }
 void pt_radeon_stats(PtRadeon *d,FILE *f) {
     if(!d || !f) return;
-    enter(d); OpticsFrontendStats s=d->stats; int direct=d->direct; leave(d);
+    enter(d); OpticsFrontendStats s=d->stats; int direct=d->direct;
+    uint64_t pf=d->pace_frames,pt=d->pace_time,pm=d->pace_max,pb[7],lw=d->lock_waits,ln=d->lock_wait_ns,lm=d->lock_wait_max; memcpy(pb,d->pace_bucket,sizeof pb); leave(d);
+    fprintf(f,"frame pacing: %llu frames while streaming, %.1f s (%.1f fps); gaps <20 ms %llu, <34 %llu, <50 %llu, <100 %llu, stalls <250 ms %llu, <500 %llu, <1 s %llu, longest %.0f ms; "
+        "device entries that waited 10 ms or more for the CP: %llu (%.2f s, longest %.0f ms)\n",(unsigned long long)pf,pt/1e9,pt?pf*1e9/pt:0.0,
+        (unsigned long long)pb[0],(unsigned long long)pb[1],(unsigned long long)pb[2],(unsigned long long)pb[3],(unsigned long long)pb[4],(unsigned long long)pb[5],(unsigned long long)pb[6],
+        pm/1e6,(unsigned long long)lw,ln/1e9,lm/1e6);
     fprintf(f,"optics-frontend: draws %llu packets %llu type0 %llu IBs %llu blits %llu (%llu bytes) refused: draws %llu packets %llu blits %llu; "
         "faults %llu (last %08x) writebacks %llu frames %llu (native %llu copied %llu) fence waits %llu completions deferred %llu RBBM reads %llu export failures %llu; "
         "VRAM %s (switches %llu), CPU view faults %llu (late syncs %llu, written granules returned %llu); approximated draws: mip %llu border %llu aniso %llu tiled %llu signed %llu%s%s\n",(unsigned long long)s.draws,(unsigned long long)s.packets,(unsigned long long)s.type0_words,
@@ -1303,7 +1350,7 @@ static int reset(PtRadeon *d) {
     if(pt_r2_io_reset(d->io)!=PT_R2_IO_OK) failed(d,"VRAM guard reset");
     if(d->ring_ready) pt_r2_ring_destroy(&d->ring);
     (void)pt_r2_timeline_reset(d->tl); d->issued=0; d->defer_head=d->defer_count=0; d->held=0;
-    d->ring_ready=0; d->cp_wait=0; d->cp_kicked=0; d->ring_stalled=0; d->frame_pending=0; if(d->stream) optics_stream_reset(d->stream); optics_r300_state_reset(d->r300);
+    d->ring_ready=0; d->cp_wait=0; d->draw_wait=0; d->cp_kicked=0; d->ring_stalled=0; d->frame_pending=0; if(d->stream) optics_stream_reset(d->stream); optics_r300_state_reset(d->r300);
     uint32_t fb=(uint32_t)(((d->vram_bytes>>16)-1)<<16); memset(d->reg,0,sizeof d->reg); d->reg[MC_FB_LOCATION/4]=fb;
     d->reg[DP_WRITE_MASK/4]=0xffffffffu;d->direction_written=0; d->epoch++;
     PtR2IoStats is; pt_r2_io_stats(d->io,&is); d->stats.failed=executor_failed || is.fatal;
@@ -1341,7 +1388,7 @@ void pt_radeon_close(PtRadeon *d) {
     for(unsigned i=0;i<FRAME_SLOTS;i++) slot_free(&d->slot[i]);
     if(d->ring_ready) pt_r2_ring_destroy(&d->ring);
     pthread_mutex_destroy(&d->frame_lock);
-    optics_stream_destroy(d->stream); optics_r300_state_destroy(d->r300); munmap(d->vram,d->vram_bytes); free(d->imm_data); free(d);
+    optics_stream_destroy(d->stream); optics_r300_state_destroy(d->r300); munmap(d->vram,d->vram_bytes); free(d->imm_data); free(d->imm_edge); free(d);
 }
 void optics_frontend_stats(const PtRadeon *d,OpticsFrontendStats *s) { if(d && s) *s=d->stats; }
 void optics_frontend_cpu_vram(const PtRadeon *d,uint64_t *accesses,uint64_t *bytes) { *accesses=d?d->stats.cpu_vram_accesses:0; *bytes=d?d->stats.cpu_vram_bytes:0; }

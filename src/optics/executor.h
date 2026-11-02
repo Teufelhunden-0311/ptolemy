@@ -12,7 +12,10 @@ typedef struct PtRadeon PtRadeon;
 /* 3D executor (Metal in the product, a CPU reference in tests). The table is stateless; every call gets the device's
  * own instance from create(), so reset/close reach all GPU-owned state (no process-global executor state).
  * All calls are CPU/I/O-owner calls except where noted. */
-enum { OPTICS_EXEC_DONE, OPTICS_EXEC_REFUSED, OPTICS_EXEC_FAILED };          /* draw: refused = unsupported state, counted */
+/* draw: refused = unsupported state, counted; busy (only a draw with defer set) = not drawn yet, its shader compiles
+ * without the device lock; the frontend leaves the packet in place and runs it again (the steps before the program are
+ * idempotent: surface imports, depth bindings, applied fast clears, texture uploads found again). */
+enum { OPTICS_EXEC_DONE, OPTICS_EXEC_REFUSED, OPTICS_EXEC_FAILED, OPTICS_EXEC_BUSY };
 enum { OPTICS_FENCE_DONE, OPTICS_FENCE_PENDING, OPTICS_FENCE_FAILED };       /* fence: every earlier GPU command */
 enum { OPTICS_FRAME_NONE, OPTICS_FRAME_SAME, OPTICS_FRAME_PENDING, OPTICS_FRAME_READY, OPTICS_FRAME_FAILED };
 typedef struct {
@@ -40,6 +43,7 @@ typedef struct {
     /* Samples that passed depth and stencil in the draws of occlusion query `query` (OpticsDraw.query), asked
      * once after a fence covering them completed; the query is forgotten. 0 = *count valid. */
     int (*query)(void *,PtRadeon *,uint32_t query,uint64_t *count);
+    int (*compiling)(void *);                        /* any thread: shaders compile in the background (a deferred draw waits) */
 } OpticsExecutor;
 void optics_frontend_set_executor(const OpticsExecutor *);
 const OpticsExecutor *optics_metal_executor(void);   /* the product Metal executor (installed by its constructor; directed tests) */

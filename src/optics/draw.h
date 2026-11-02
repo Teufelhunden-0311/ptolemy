@@ -20,6 +20,8 @@ typedef struct {
     uint8_t levels;                         /* mip levels uploaded and sampled (1: level 0 only) */
     uint32_t depth;                         /* 3D: slices (TX_FORMAT0 [25:22] log2), stored one after another; 0: 2D */
     uint8_t floating;                       /* float formats 0x18..0x1d: 1 + (format - 0x18) (I16, I16A16, RGBA16, I32, I32A32, RGBA32); 0 none */
+    uint8_t absent;                         /* a disabled unit the fragment program samples: (0, 0, 0, 1), no guest memory */
+    uint8_t tile;                           /* TX_OFFSET [4:2]: macro tile (bit 0), micro tile (2:1) */
 } OpticsTexture;
 typedef struct { uint16_t offset; uint8_t components,format; } OpticsRawAttribute;
 typedef struct {
@@ -41,6 +43,7 @@ typedef struct {
     uint16_t raw_select[16]; uint8_t raw_general; /* VAP routing, normalized raw_vertex.h formats. */
     uint32_t indices; uint32_t *index; uint8_t lines;   /* triangle list, or pairs of a line list when lines */
     uint32_t query;                         /* occlusion query counting this draw (set by the frontend), 0 none */
+    uint8_t defer;                          /* (set by the frontend) the draw may come back later: OPTICS_EXEC_BUSY while a shader compiles */
     uint32_t position_output,color_output,varyings;
     uint8_t pvs_output[OPTICS_DRAW_VARYINGS],us_input[OPTICS_DRAW_VARYINGS];
     /* RS component selection per varying: 0..3 output component, 4 zero, 5 one. */
@@ -102,6 +105,9 @@ typedef struct {
     uint8_t fill;                                  /* GA_POLY_MODE: 0 fill, 1 both faces as lines */
     uint8_t poly_front,poly_back;                  /* GA_POLY_MODE per face: 0 points, 1 lines, 2 filled (also when off); faces in
                                                     * different modes are drawn by the frontend in two passes, one per face */
+    uint8_t polyline,poly_prim; uint32_t poly_count;   /* polygons of a non-indexed draw with a face in line mode (and none in point
+                                                    * mode): classified on the CPU after the build (draw.c polyline), drawn as
+                                                    * lines or kept filled; the primitive type and vertex count they came as */
     float line_width;                              /* GA_LINE_CNTL: line width in pixels */
     uint8_t point_size_output; float point_min,point_max;   /* VAP_OUT_VTX_FMT_0 bit 16: PVS output of each point's size (.x), 0 none; GA_POINT_MINMAX */
     float lod_bias[OPTICS_DRAW_TEXTURES];          /* TX_FILTER1 [12:3], in levels */
@@ -113,12 +119,15 @@ typedef struct {
 /* Texture state the executor approximates: MIP: levels it does not model (TXPITCH with levels, more levels than the
  * size has), BORDER: mirror-once to a border, ANISO: an unseen anisotropy field (above
  * 16:1), micro/macro-tiled texels read as linear; YUV601: YUV422 converted with BT.601 coefficients; WIDE: colour
- * targets other than ARGB8888 rendered at 8 bits per channel, 16-bit texture channels (W16Z16Y16X16, X16) held at 8. */
+ * targets other than ARGB8888 rendered at 8 bits per channel, 16- and 10-bit texture channels (W16Z16Y16X16, X16,
+ * W2Z10Y10X10) held at 8. */
 enum { OPTICS_APPROX_MIP=1, OPTICS_APPROX_BORDER=2, OPTICS_APPROX_ANISO=4, OPTICS_APPROX_TILED=8, OPTICS_APPROX_YUV601=16, OPTICS_APPROX_WIDE=32,
        OPTICS_APPROX_FIXED=64, OPTICS_APPROX_SIGNED=128 };   /* FIXED: a fixed-function state draw.h does not model (polygon points, fog
                                                               * inputs); SIGNED: texture components flagged signed, read as unsigned */
 /* Vertex arrays from 3D_LOAD_VBPNTR: per array dword components, dword stride and GPU address. */
-typedef struct { uint32_t count; struct { uint32_t components,stride; uint64_t offset; } array[16]; uint32_t local; } OpticsAos;   /* local: bit k, array k is in VRAM */
+typedef struct { uint32_t count; struct { uint32_t components,stride; uint64_t offset; } array[16]; uint32_t local;   /* local: bit k, array k is in VRAM */
+    const uint8_t *edge; uint8_t faces; } OpticsAos;   /* edge: each vertex's edge flag (register-written vertices) or NULL; faces: polygon-mode
+                                                       * faces to draw (draw.h polyline), 1 front, 2 back, 0 both */
 /* GPU-memory read for vertex/index fetch; returns nonzero on success. */
 typedef int (*OpticsFetch)(void *,uint64_t gpu,void *,size_t);
 /* reg: the frontend register file (REG_BYTES/4 words). payload: the LE-normalized packet3 words after the header. */
