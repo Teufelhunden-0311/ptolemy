@@ -46,7 +46,7 @@ int main(void)
         for (unsigned i = 0; i < 4; i++) { uint32_t ub = be32(c.vr[b] + 4 * i), ur; float fb, r; memcpy(&fb, &ub, 4); r = 1.0f / fb; memcpy(&ur, &r, 4);
             special |= denormal(ub) | (!rsq && denormal(be32(c.vr[a] + 4 * i))) | (o == 7 && denormal(ur)); }
         CPU expected = c; assert(ppc_altivec(&expected, in));
-        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_neon_enabled = vmx_fp2_enabled = 1;
+        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_neon_enabled = vmx_fp2_enabled = 1; vmx_checked = 0;
         memset(cmap, -1, sizeof cmap); cwr = 0;
         pthread_jit_write_protect_np(0);
         cp = code; E(0xa9bf7bfb); E(0xaa0003fb);       /* stp x27, x30, [sp, #-16]!; mov x27, x0 */

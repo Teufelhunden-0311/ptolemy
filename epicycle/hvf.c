@@ -18,11 +18,12 @@
 // A JIT access address is the 64-bit sum [xN, #imm]: guest EA + offset can cross 2^32 (base 0xFFFFFFFC + 4 is EA 0).
 // So VA 4..8 GiB aliases EA 0..4 GiB in every root, and the engine sits above, from 8 GiB, out of the guest's reach.
 #define ENG (8ull << 30)                          // the engine at 8 GiB
-enum { O_PT = 0, O_VEC = 0x1000, O_TLBI = 0x1800, O_ENV = 0x4000, O_L2 = 0x10000, O_SLOT = 0x20000, O_MAPPED = 0x70000, O_JC = 0x200000, O_PGGEN = 0x400000,
-       O_CODE = 0x800000, O_POOL = 72 << 20, ENG_SIZE = 88 << 20, POOLN = (ENG_SIZE - O_POOL) / 4096 };   // jump cache 2 MB, page generations 4 MB
+enum { O_PT = 0, O_VEC = 0x1000, O_TLBI = 0x1800, O_ENV = 0x4000, O_L2 = 0x10000, O_SLOT = 0x20000, O_MAPPED = 0x70000, O_CODEMAP = 0x80000, O_JC = 0x200000, O_PGGEN = 0x400000,
+       O_CODE = 0x800000, O_POOL = 72 << 20, ENG_SIZE = 88 << 20, POOLN = (ENG_SIZE - O_POOL) / 4096 };   // code map 1 MB, jump cache 2 MB, page generations 4 MB
 _Static_assert(sizeof(CPU)<=O_L2-O_ENV,"CPU state overlaps ARM page tables");
 typedef struct { uint64_t pc, code; uint32_t gen, pad; uint64_t pad2; } JC;
 extern void *jit_vm_buf; extern size_t jit_vm_size; extern int64_t jit_delta; extern JC *jit_vm_jc; extern uint64_t jit_vm_jc_va;
+extern uint8_t *jit_vm_cm; extern uint64_t jit_vm_cm_va;
 extern uint32_t *jit_pggen; extern uint32_t jit_pggen_off, jit_mapped_off; void jit_mmio_note(uint64_t pc); uint32_t jit_ppc_pc(uint64_t pc);
 extern int (*jit_vm_enter)(CPU *, void *); extern uint32_t *jit_tramp, *jit_tlbi_eret; extern int jit_zbase;
 extern int jit_stats_on; extern uint64_t jit_tm[8]; uint64_t jit_now(void);
@@ -311,6 +312,7 @@ CPU *pt_hv_init(int sys) {                                            // sys: ba
 
     jit_vm_buf = eng + O_CODE; jit_vm_size = O_POOL - O_CODE; jit_delta = (int64_t)(ENG + O_CODE) - (int64_t)(eng + O_CODE);
     jit_vm_jc = (JC *)(eng + O_JC); jit_vm_jc_va = ENG + O_JC; jit_vm_enter = vm_enter; jit_zbase = 1;
+    jit_vm_cm = eng + O_CODEMAP; jit_vm_cm_va = ENG + O_CODEMAP;
     jit_pggen = (uint32_t *)(eng + O_PGGEN); jit_pggen_off = O_PGGEN - O_ENV; if (sys) jit_mapped_off = O_MAPPED - O_ENV;
     env_va = ENG + O_ENV; if (sys) { jit_dmap = vm_dmap; jit_dsr = vm_dsr; jit_dtlbie = vm_dtlbie; }
     return (CPU *)(eng + O_ENV);

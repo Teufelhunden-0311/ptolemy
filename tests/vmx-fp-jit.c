@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later
  * The real JIT emitter's vaddfp/vsubfp/vmaxfp/vminfp/vmaddfp/vnmsubfp against the interpreter, bit for bit: random and special lanes
  * (zero, denormal, NaN, infinity, overflow/underflow), VSCR.NJ on/off, user/system mode, register aliasing.
- * Every case completes in the JIT (NaN and denormal lanes too); vcfux/vcfsx with every UIMM. */
+ * Every case completes in the JIT (NaN and denormal lanes too); vcfux/vcfsx/vctuxs/vctsxs with every UIMM. */
 #include "../epicycle/jit.c"
 #include <assert.h>
 #include <pthread.h>
@@ -45,7 +45,7 @@ int main(void)
             special |= odd(ua) | odd(ub) | (o < 2 && odd(uk)) | odd(bits(f));
         }
         CPU expected = c; assert(ppc_altivec(&expected, in));
-        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_neon_enabled = vmx_fp_enabled = 1;
+        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_neon_enabled = vmx_fp_enabled = 1; vmx_checked = 0;
         memset(cmap, -1, sizeof cmap); cwr = 0;
         pthread_jit_write_protect_np(0);
         cp = code; E(0xa9bf7bfb); E(0xaa0003fb);       /* stp x27, x30, [sp, #-16]!; mov x27, x0 */
@@ -66,11 +66,11 @@ int main(void)
         }
         if (special) slow++; else fast++;
     }
-    for (unsigned n = 0; n < 64000; n++) {             /* vcfux vcfsx */
-        unsigned d = rnd() & 31, k = n & 31, b = rnd() & 31, x = n & 32 ? 0x34a : 0x30a;
+    for (unsigned n = 0; n < 64000; n++) {             /* vcfux vcfsx vctuxs vctsxs */
+        unsigned d = rnd() & 31, k = n & 31, b = rnd() & 31, x = (const unsigned[]){0x30a, 0x34a, 0x38a, 0x3ca}[n >> 5 & 3];
         uint32_t in = 4u << 26 | d << 21 | k << 16 | b << 11 | x;
-        CPU c = {0}; c.msr = MSR_VEC; c.pc = 0x1000; c.spr[287] = 0x80030101; c.vscr = n & 64 ? 0x10000 : 0;
-        for (unsigned r = 0; r < 32; r++) for (unsigned i = 0; i < 4; i++) wbe32(c.vr[r] + 4 * i, n & 128 ? rnd() : rnd() >> (rnd() & 31));
+        CPU c = {0}; c.msr = MSR_VEC; c.pc = 0x1000; c.spr[287] = 0x80030101; c.vscr = n & 128 ? 0x10000 : 0;
+        for (unsigned r = 0; r < 32; r++) for (unsigned i = 0; i < 4; i++) wbe32(c.vr[r] + 4 * i, x >= 0x38a ? lane() : n & 256 ? rnd() : rnd() >> (rnd() & 31));
         CPU expected = c; assert(ppc_altivec(&expected, in));
         jsys = 0; memset(cmap, -1, sizeof cmap); cwr = 0;
         pthread_jit_write_protect_np(0);
@@ -80,12 +80,12 @@ int main(void)
         pthread_jit_write_protect_np(1);
         __builtin___clear_cache((char *)code, (char *)(exit_common + 2));
         ((void (*)(CPU *))(void *)code)(&c);
-        if (memcmp(&c, &expected, sizeof c)) { fprintf(stderr, "vcf%cx mismatch k=%u\n", x == 0x34a ? 's' : 'u', k); return 1; }
+        if (memcmp(&c, &expected, sizeof c)) { fprintf(stderr, "conversion %03x mismatch k=%u\n", x, k); return 1; }
     }
     cp = code; vmx_fp_enabled = 0;
     assert(tr(4u << 26 | 46u, 0x2000) == -1 && cp == code);     /* PT_VMX_FP=0 */
     vmx_fp_enabled = 1; jmsr = MSR_750;
     assert(tr(4u << 26 | 46u, 0x2000) == -1 && cp == code);     /* VEC off at translation: interpreter */
-    printf("VMX FP JIT (6 ops): %u ordinary + %u NaN/denormal cases, and 64000 vcfux/vcfsx, all in the JIT, bit-exact vs interpreter; switch and VEC rejection PASS.\n", fast, slow);
+    printf("VMX FP JIT (6 ops): %u ordinary + %u NaN/denormal cases, and 64000 vcfux/vcfsx/vctuxs/vctsxs, all in the JIT, bit-exact vs interpreter; switch and VEC rejection PASS.\n", fast, slow);
     return 0;
 }

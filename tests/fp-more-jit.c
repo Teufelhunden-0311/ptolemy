@@ -53,7 +53,7 @@ int main(void)
         CPU before = c;
         ((void (*)(CPU *))(void *)code)(&c);
         double x = before.fpr[b];
-        int must_slow = !(x > 0) || (before.fpscr & 0xff);
+        int must_slow = !(x > 0) || (before.fpscr & 0xfb);          /* NI stays in the JIT: the interpreter ignores it too */
         if (c.jit_exit == X_INTERP) {
             assert(must_slow && !memcmp(c.fpr, before.fpr, sizeof c.fpr) && c.fpscr == before.fpscr);
             slow++;

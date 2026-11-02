@@ -49,10 +49,11 @@ int main(int argc, char **argv) {
     wbe32(c.mem, 0x48000000); wbe32(c.mem+0x20, 0x48000000); wbe32(c.mem+0x40020, 0x48000000);
     jit_vm_buf = calloc(1, 64 << 20); jit_vm_size = 64 << 20;
     jit_vm_jc = calloc(1 << 16, sizeof(JC)); jit_vm_jc_va = (uint64_t)jit_vm_jc;
+    jit_vm_cm = calloc(1, 1 << 20); jit_vm_cm_va = (uint64_t)jit_vm_cm;      // the code map (icbi)
     jit_vm_enter = fake_enter;
     jit_run(&c);
     assert(phase == 7 && !c.exit_code);
     puts("JIT cache invalidation: PASS");
-    free(c.mem); free(jit_vm_buf); free(jit_vm_jc);
+    free(c.mem); free(jit_vm_buf); free(jit_vm_jc); free(jit_vm_cm);
     return 0;
 }

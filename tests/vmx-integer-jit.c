@@ -18,7 +18,10 @@ int main(void) {
         0x020,0x021, /* vmhaddshs vmhraddshs (VA: c in bits 6-10) */
         0x08e,0x0ce,0x10e,0x14e,0x18e,0x1ce, /* saturating packs */
         0x022, /* vmladduhm (VA: c in bits 6-10) */
-        0x1c4,0x2c4 /* vsl vsr: the whole register by vB[15] & 7 bits */
+        0x1c4,0x2c4, /* vsl vsr: the whole register by vB[15] & 7 bits */
+        0x024,0x025,0x026,0x027,0x028,0x029, /* vmsumubm vmsummbm vmsumuhm vmsumuhs vmsumshm vmsumshs (VA) */
+        0x608,0x648,0x708,0x688,0x788, /* vsum4ubs vsum4shs vsum4sbs vsum2sws vsumsws */
+        0x004,0x044,0x084 /* vrlb vrlh vrlw */
     };
     uint32_t *code = mmap(NULL, 65536, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS|MAP_JIT, -1, 0);
     assert(code != MAP_FAILED);
@@ -27,7 +30,7 @@ int main(void) {
         unsigned xo = ops[oi], a = rnd() & 31, b = rnd() & 31, d = rnd() & 31;
         if (xo == 0x20e || xo == 0x24e || xo == 0x28e || xo == 0x2ce) a = 0;
         uint32_t in = 4u << 26 | d << 21 | a << 16 | b << 11 | xo;
-        if (xo == 0x020 || xo == 0x021 || xo == 0x022) in |= (rnd() & 31) << 6;
+        if (xo >= 0x020 && xo < 0x030) in |= (rnd() & 31) << 6;
         CPU c = {0}; c.pc = 0x1000; c.sys = k & 1; c.msr = k & 2 ? MSR_VEC : 0;
         c.spr[287] = 0x80030101; c.vscr = (k >> 2 & 1) | (k >> 3 & 1) << 16;
         for (unsigned i = 0; i < 16; i++) c.crtab[i] = cr_make(i >> 3 & 1, i >> 2 & 1, i >> 1 & 1, i & 1);
@@ -39,7 +42,7 @@ int main(void) {
         CPU expected = c;
         if (c.sys && !(c.msr & MSR_VEC)) { expected.pc = 0x2000; expected.jit_exit = X_INTERP; }
         else assert(ppc_altivec(&expected, in));
-        jmsr = MSR_750|MSR_VEC; jsys = c.sys; vmx_neon_enabled = vmx_int2_enabled = vmx_mhadd_enabled = 1;
+        jmsr = MSR_750|MSR_VEC; jsys = c.sys; vmx_neon_enabled = vmx_int2_enabled = vmx_mhadd_enabled = 1; vmx_checked = 0;
         cwr = 0; memset(cmap, -1, sizeof cmap);
         pthread_jit_write_protect_np(0);
         cp = code; E(0xa9bf7bfb); E(0xaa0003fb); exit_common = code + 4096;

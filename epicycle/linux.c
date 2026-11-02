@@ -69,6 +69,7 @@ void guest_prepare(CPU *c, int n, char **args) {   // ELF, stack and registers; 
     for (int f = 0; f < 8; f++) c->cr[f] = cr_make(0, 0, 0, 0);
     c->pc = load_elf(c, args[0], 0);
     c->msr = MSR_PR | MSR_FP; c->spr[287] = 0x80020101;
+    if (getenv("PT_G4")) { c->msr |= MSR_VEC; c->spr[287] = 0x80030102; }   // PT_G4=1: the 7447A with AltiVec (vmsum.S)
     c->preg[0] = (PRegion){0, 1ull << 32, c->mem}; c->npreg = 1;
     uint32_t top = 0x7fff0000, sp; map(c, top - 0x100000, top);
     // stack: argc, argv[], NULL, envp NULL, auxv {AT_PAGESZ,4096},{AT_NULL}
@@ -101,7 +102,7 @@ void sys_prepare(CPU *c, const char *path) {
     map(c, 0, 16 << 20);
     for (int f = 0; f < 8; f++) c->cr[f] = cr_make(0, 0, 0, 0);
     c->pc = load_elf(c, path, 1);
-    c->sys = 1; c->msr = MSR_IP; c->spr[287] = 0x00080301;                              // PVR 750 v3.1
+    c->sys = 1; c->msr = MSR_IP; c->spr[287] = getenv("PT_SYS_G4") ? 0x80030102 : 0x00080301;   // PVR 750 v3.1; PT_SYS_G4=1: 7447A (sys9.S)
     c->preg[0] = (PRegion){0, HOLE, c->mem};
     c->preg[1] = (PRegion){HOLE + HOLESZ, (1ull << 32) - HOLE - HOLESZ, c->mem + HOLE + HOLESZ}; c->npreg = 2;
     c->env_mmio = hole_mmio;

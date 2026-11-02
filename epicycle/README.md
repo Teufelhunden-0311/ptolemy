@@ -29,9 +29,13 @@ Tests live in `../tests/epicycle/`:
 | `regress.c` | semantic regression: FPU and integer edge cases per Book I, the PT_CHECK comparator, translation at a page edge |
 | `jit_cache.c` | JIT cache invalidation regression: hash collisions, generation wrap, the X_LOOKUP path |
 | `lab.py` | counterexample lab: random programs against Unicorn (750 model) with Book I corrections, ddmin minimization |
-| `sys1.S` .. `sys6.S`, `sys.ld` | bare metal: exceptions (sys1), MMU (sys2), DEC, POW, icbi, devices, EA wrap, string instructions (sys3), SR switches in real mode (sys4), one VSID in two SRs (sys5), the jump cache across a segment alias (sys6) |
-| `ref/sys1.bin` .. `ref/sys3.bin` | reference journals of sys1-sys3 |
-| `loop.S`, `atom.S`, `ops2.S`, `fp.S`, `str.S`, `fpa.S` | JIT against the interpreter (PT_CHECK=1): a side exit in a loop; lwarx/stwcx., dcbz; CR logic, sraw, lswi; FP loads, fmr...; lswx/stswx, mffs/mtfsf; FP arithmetic |
+| `sys1.S` .. `sys9.S`, `sys.ld` | bare metal: exceptions (sys1), MMU (sys2), DEC, POW, icbi, devices, EA wrap, string instructions (sys3), SR switches in real mode (sys4), one VSID in two SRs (sys5), the jump cache across a segment alias (sys6); twi in the VM: every TO bit, the 0xFFF00700 vector, from user mode (sys7); icbi at DR=1, supervisor and user, through an alias no ARM entry holds (sys8); FP and VMX unavailable in the VM, also after an mtmsr in the block (sys9, 7447A) |
+| `ref/sys1.bin` .. `ref/sys3.bin`, `ref/sys7.bin` .. `ref/sys9.bin` | reference journals of sys1-sys3 and sys7-sys9 |
+| `loop.S`, `atom.S`, `ops2.S`, `fp.S`, `str.S`, `fpa.S` | JIT against the interpreter (PT_CHECK=1): a side exit in a loop; lwarx/stwcx., dcbz; CR logic, sraw, lswi; FP loads, fmr...; lswx/stswx, mffs/mtfsf; FP arithmetic (also with FPSCR[NI]=1) |
+| `vmsum.S` | vmsumshm/vmsumshs, JIT against the interpreter (`PT_G4=1 PT_VMX_NEON=1 PT_VMX_MHADD=1`, with PT_CHECK=1) |
+| `vmxops.S` | the other multiply-sums, vsum*, vrl*, vpkpx, vctuxs/vctsxs (threshold lanes, VSCR.NJ), JIT against the interpreter (`PT_G4=1 PT_VMX_NEON=1 PT_VMX_INT2=1`, with PT_CHECK=1) |
+| `so.S` | XER[SO]=1: blocks for SO=1 (compares, record forms, OE forms, stwcx., mtxer switches, jump cache), JIT against the interpreter (with PT_CHECK=1, PT_CR_FUSE=1) |
+| `brl.S` | conditional bcctrl/bclrl on a CR bit, taken and not taken (LR written either way), JIT against the interpreter (with PT_CHECK=1) |
 | `hello.c`, `coremark/` | guest programs (CoreMark 1.0 by EEMBC, see `coremark/LICENSE.md`) |
 | `hvprobe.c`, `hvc_matrix.c`, `uma_probe.m` | macOS probes: HVF big-endian support, granule and exit cost; `hvc` behaviour; memory shared by the VM and Metal |
 
@@ -62,6 +66,7 @@ PowerPC test programs:
     ./pt prog.ppc [args]          # JIT
     ./pt -i prog.ppc [args]       # interpreter
     ./pt -s test.elf > out.bin    # bare metal: the 4 KB result journal goes to stdout when the test reaches `b .`
+                                  # (a 750; PT_SYS_G4=1: the 7447A with VMX)
 
 `ptv` takes the same options. Environment switches:
 
@@ -75,8 +80,9 @@ PowerPC test programs:
 - `PT_INTERP_BATCH=n` (1..4096): after an untranslatable instruction the interpreter goes on until more than 8
   translatable instructions come in a row, at most n instructions. Default 256 on the machine, 1 in the stands;
   `PT_CHECK` and `PT_MAXBLK=1` force 1.
-- `PT_VMRFI`, `PT_VMSC`, `PT_VMMSR`: rfi, sc and mode-changing mtmsr directly in the VM (default 1, machine only;
-  0: through the environment; 2: also on the bare-metal stand, so that the sys tests exercise these paths).
+- `PT_VMRFI`, `PT_VMSC`, `PT_VMMSR`: rfi, sc (with it the twi trap and FP/VMX unavailable) and mode-changing mtmsr
+  directly in the VM (default 1, machine only; 0: through the environment; 2: also on the bare-metal stand, so that
+  the sys tests exercise these paths).
 - Fast paths that are off by default in the engine: `PT_FPR_CACHE`, `PT_FP_HOIST`, `PT_FP_LAZY`, `PT_FP_ROUND_FAST`,
   `PT_FMA_FAST`, `PT_FMA_DIRECT_S`, `PT_FP_MIXED`, `PT_FP_MORE`, `PT_CR_FUSE`, `PT_VMX_NEON`, `PT_VMX_INT2`,
   `PT_VMX_MHADD`, `PT_VMX_FP2` (`=1` enables). A window launch of the product without `--cpu` enables most of them
@@ -93,9 +99,10 @@ PowerPC test programs:
 - `jit_cache.c` includes `jit.c`; build it like `regress.c` on AArch64 Linux or macOS.
 - `lab.py` needs the `unicorn` and `capstone` Python packages: `python3 tests/epicycle/lab.py epicycle/pt [N [SEED]]`
   (exit 0: no mismatches).
-- Assembly tests under `PT_CHECK=1`: `atom.S` exits with 7, `loop.S` with 3, `str.S` with 63; `ops2.S`, `fp.S` and
-  `fpa.S` exit with a hash that must equal the interpreter's (`-i`).
-- Bare metal: for sys1-sys3 every mode (interpreter, JIT, `PT_CHECK=1`) must reproduce `ref/sysN.bin` byte for byte;
+- Assembly tests under `PT_CHECK=1`: `atom.S` exits with 7, `loop.S` with 3, `str.S` with 63; `ops2.S`, `fp.S`,
+  `fpa.S`, `vmsum.S`, `vmxops.S`, `so.S` and `brl.S` exit with a hash that must equal the interpreter's (`-i`).
+- Bare metal: for sys1-sys3 and sys7-sys9 (sys9 with `PT_SYS_G4=1`) every mode (interpreter, JIT, `PT_CHECK=1`) must
+  reproduce `ref/sysN.bin` byte for byte;
   for sys4-sys6 the JIT (on `ptv` with `PT_VMRFI=2 PT_VMMSR=2`) must match the interpreter (`-i -s`).
 - Probes: build with clang and `-framework Hypervisor` (`uma_probe.m` also needs Metal and Foundation) and sign with
   `hv.entitlements`; `hvc_matrix.c` gives its command in its header.
@@ -104,11 +111,14 @@ PowerPC test programs:
 
 - Registers: r0-r12 and r31 stay in fixed ARM registers; the most used other GPRs get a per-block cache (x15, x18-x25,
   and x28 when the guest sits at host address 0).
-- Blocks never cross a 4 KB page and are keyed by `pc | PR << 1 | IR` and the physical page, so processes that share
-  code (dyld, a program after fork) share translations. Direct links stay within a page; other targets go through the
+- Blocks never cross a 4 KB page and are keyed by `pc | PR << 1 | IR`, XER.SO and the physical page, so processes that share
+  code (dyld, a program after fork) share translations; an SO change inside a block (mtxer, an OE overflow) goes on
+  through the jump cache keyed with the new SO. Direct links stay within a page; other targets go through the
   jump cache (64 Ki cells of 32 bytes, two ways; the key holds pc, the mode and, with IR=1, the target segment's SR).
   In the VM each cell also keeps the EA page generation that tlbie bumps; the Linux stand clears the jump cache on
-  tlbie. icbi followed by context synchronization drops the blocks of that physical page.
+  tlbie. icbi followed by context synchronization drops the blocks of that physical page. JIT code queues the page
+  itself (in the VM it finds it with AT) and skips a page without translated code (a byte map), so XNU's sync_cache64
+  over every new page does not leave the JIT; only the isync after a queued page does.
 - VM: guest physical memory is the IPA space; code runs at EL1 and leaves with `brk #0` (not `hvc`, see
   `hvc_matrix.c`). Data goes through three TTBR0 roots (real mode, DR=1 supervisor, DR=1 user) with their own ASIDs
   and up to 8 cached SR configurations. A DSI from JIT code restores the precise PPC state from the host PC
@@ -144,7 +154,6 @@ the lab cannot check it because Unicorn has no FR.
 
 - A BAT, SDR1 or machine state change (`xgen`) flushes the whole JIT cache and all host mappings.
 - Ordinary loads and stores raise no alignment exception; direct-store segments (T=1) are not supported.
-- With XER.SO=1 the interpreter runs until SO clears.
 - Rare instructions run in the interpreter: FP record forms (Rc=1), fres, mcrfs, mtfsb0/mtfsb1, BAT writes, FP special
   cases, and frsqrte/stfiwx unless `PT_FP_MORE=1`.
 - An EA past 2^32 (base + positive offset, formed in 64 bits by the JIT) wraps in the VM, where VA 4-8 GiB aliases

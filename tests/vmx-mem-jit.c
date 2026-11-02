@@ -29,7 +29,7 @@ int main(void)
         CPU expected = c; expected.preg[0].host = m2; c.preg[0].host = m1;
         if (sys && !vec) { expected.pc = 0x2000; expected.jit_exit = X_INTERP; }
         else assert(ppc_altivec_mem(&expected, in) == 0);
-        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_mem_enabled = vmx_int2_enabled = 1; zbase = 0;
+        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_mem_enabled = vmx_int2_enabled = 1; zbase = 0; vmx_checked = 0;   /* one instruction a block */
         memset(cmap, -1, sizeof cmap); cwr = 0;
         pthread_jit_write_protect_np(0);
         cp = code;
@@ -61,7 +61,7 @@ int main(void)
         CPU expected = c;
         if (sys && !vec) { expected.pc = 0x2000; expected.jit_exit = X_INTERP; }
         else assert(ppc_altivec(&expected, in));
-        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_vscr_enabled = 1;
+        jmsr = MSR_750 | MSR_VEC; jsys = sys; vmx_vscr_enabled = 1; vmx_checked = 0;
         memset(cmap, -1, sizeof cmap); cwr = 0;
         pthread_jit_write_protect_np(0);
         cp = code;

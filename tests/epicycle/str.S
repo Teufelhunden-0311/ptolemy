@@ -1,6 +1,6 @@
-# str.S: lswx/stswx (n from XER, wrap from r31 to r0, n = 0), mffs/mtfsf/mtfsfi, JIT against the interpreter (PT_CHECK=1).
+# str.S: lswx/stswx (n from XER, wrap from r31 to r0, n = 0), mffs/mtfsf/mtfsfi/mtfsb0/mtfsb1, JIT against the interpreter (PT_CHECK=1).
 # lswx/stswx are .long words: the LLVM assembler does not know them. Exit code 63: +1 lswx 7 bytes, +2 lswx 13 bytes with wrap, +4 stswx 9 bytes, +8 n = 0 touches nothing,
-# +16 mtfsf/mffs (summary VX/FEX computed), +32 mtfsfi
+# +16 mtfsf/mffs (summary VX/FEX computed), +32 mtfsfi, +64 mtfsb1/mtfsb0 (FX only for a new exception bit, FEX untouched, summaries)
     .globl _start
 _start:
     lis 3, src@ha
@@ -100,7 +100,22 @@ _start:
     mtfsfi 7, 0
     mtfsfi 6, 0
     ori 9, 9, 32
-6:  mr 3, 9
+6:  mtfsb1 31               # RN = 1
+    mtfsb1 3                # OX, new: FX
+    mtfsb1 7                # VXSNAN: VX
+    mtfsb1 1                # FEX: a summary bit, unchanged
+    mtfsb0 0                # FX = 0
+    mtfsb1 3                # OX again: not new, FX stays 0
+    mtfsb1 25               # OE: FEX (OX & OE)
+    mffs 2
+    stfd 2, 8(5)
+    lwz 8, 12(5)
+    lis 7, 0x7100           # FEX | VX | OX | VXSNAN
+    ori 7, 7, 0x0041        # OE | RN = 1
+    cmpw 8, 7
+    bne 7f
+    ori 9, 9, 64
+7:  mr 3, 9
     li 0, 1
     sc
     .data

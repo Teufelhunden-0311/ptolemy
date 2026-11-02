@@ -11,7 +11,8 @@ enum { PEND_EXT = 1, PEND_DEC = 2 };                                        // p
 // A CR field is stored as a 64-bit value V:
 //   LT <=> bit 62,  GT <=> (int64)V > 0,  EQ <=> (uint32)V == 0,  SO <=> bit 61 XOR bit 63.
 // A compare of a,b with XER.SO=0 gives V = a - b in 64 bits (|V| < 2^32, the high bits are the sign, so SO=0):
-// 1-2 ARM64 instructions, and the field's old SO clears by itself. XER.SO=1 is a rare slow mode (interpreter only).
+// 1-2 ARM64 instructions, and the field's old SO clears by itself. With XER.SO=1 the JIT runs blocks translated for
+// SO=1, which set SO in the fields they compute (jit.c so_cr).
 typedef struct CPU {
     uint32_t gpr[32];
     uint64_t cr[8];
@@ -27,9 +28,10 @@ typedef struct CPU {
     uint8_t *mem;
     uint64_t icount;                // for the interpreter/statistics
     int halted, exit_code;
-    uint32_t jit_exit, jit_off;     // exit reason from JIT code; jit_off 1 = interpreter only
+    uint32_t jit_exit;              // exit reason from JIT code
     uint64_t jit_link;              // branch address for block linking
     void *jit_jc;                   // jump cache: JC {key, code, page generation}[65536] (jit.c)
+    void *jit_codemap;              // physical page -> 1: translated code may be there (jit.c; icbi in JIT code reads it)
     uint64_t crtab[16];             // CR nibble -> field value (for mtcrf in the JIT)
     uint64_t tb_a, tb_m;            // TB in the VM: tb = tb_a + (CNTVCT * tb_m) >> 32 (mftb without an exit); tb_m = 0: none
     uint64_t dec_tbw; uint32_t dec_w, dec_pad;   // DEC in the VM: dec = dec_w - (TB - dec_tbw)

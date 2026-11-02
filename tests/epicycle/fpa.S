@@ -1,6 +1,7 @@
 # fpa.S: FP arithmetic, JIT against the interpreter (PT_CHECK=1): fadd fsub fmul fdiv fmadd fmsub fnmadd fnmsub
 # (double and single), frsp, fctiw(z), fsel, fcmpu/fcmpo on all pairs of 16 values (ordinary, +-0, +-Inf, QNaN, SNaN,
-# double and single denormals, overflow edges), three passes: RN=0; RN=1; VE=1 (special cases go to the interpreter).
+# double and single denormals, overflow edges), four passes: RN=0; RN=1; VE=1 (special cases go to the interpreter);
+# NI=1 (non-IEEE mode, as Mac OS 9's sound code sets it: the JIT's fast path takes it, both give the IEEE result).
 # The results and FPSCR after every operation are folded into r26; the exit code is the xor of its bytes.
     .set N, 16
     .macro CK fr
@@ -97,6 +98,8 @@ lj:
     beq 1f
     cmpwi 29, 2
     beq 2f
+    cmpwi 29, 3
+    beq 3f
     srwi 3, 26, 8
     xor 3, 3, 26
     srwi 4, 26, 16
@@ -110,6 +113,9 @@ lj:
     b pass
 2:  mtfsfi 7, 0
     mtfsfi 6, 8
+    b pass
+3:  mtfsfi 6, 0
+    mtfsfi 7, 4
     b pass
     .data
     .balign 8
