@@ -9,7 +9,7 @@ IEEE 1275 Open Firmware, licensed GPL-2.0. The fork starts from upstream commit
 | File | Change |
 |---|---|
 | `Makefile.target`, `config/scripts/ptolemy-build-date.py` | The banner's build date comes from `SOURCE_DATE_EPOCH`, so builds are reproducible |
-| `arch/ppc/qemu/init.c` | The board signature `PTOL`; a 1.25 GiB PCI memory window (the Radeon's 256 MiB VRAM BAR fits); the 7447A's L2 cache node |
+| `arch/ppc/qemu/init.c` | The board signature `PTOL`; a 1.25 GiB PCI memory window (the Radeon's 256 MiB VRAM BAR fits); the 7447A's L2 cache node; `altivec` and `data-streams` on the G4 cpu node, as Apple's firmware has them (Classic compares them with Gestalt) |
 | `drivers/macio.c` | The Screamer sound node Tiger's audio driver expects |
 | `drivers/pmu.c` | The VIA handshake is left as Apple's firmware leaves it before the OS starts |
 | `drivers/pci.c`, `drivers/pci_database.c` | The Radeon 9700 (`1002:4e44`, `ATY,R300`) gets the boot display FCode below |
@@ -29,5 +29,6 @@ SOURCE_DATE_EPOCH=1792972800 make
 ```
 
 The ROM is `obj-ppc/openbios-qemu.elf`. With that epoch and toolchain its SHA-256 is
-`cf9e57a70b6c9df10a4019d5d5df64e537fa157fa88bd26fb041b6db73229bda`, the ROM of Ptolemy 1.0 beta 1.
+`288c1874bc849d5cad6c19ccc7ef4671582a79a1c26e445a44cecccd4f1c95a8`, the ROM of Ptolemy 1.0 beta 2; beta 1 carried
+`cf9e57a70b6c9df10a4019d5d5df64e537fa157fa88bd26fb041b6db73229bda`, before the cpu node's AltiVec properties.
 The engine loads it with `--rom`; Ptolemy.app carries it as `openbios-ppc`.

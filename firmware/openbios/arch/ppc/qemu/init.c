@@ -411,6 +411,10 @@ cpu_g4_init(const struct cpudef *cpu)
 {
     cpu_generic_init(cpu);
     cpu_add_pir_property();
+    /* Ptolemy fork: AltiVec and its data-stream instructions as empty properties, as Apple's G4 cpu nodes have them;
+     * without them Classic logs "Device Tree and Gestalt disagree about availability of vector instructions". */
+    set_property(get_cur_dev(), "altivec", NULL, 0);
+    set_property(get_cur_dev(), "data-streams", NULL, 0);
     if (cpu->iu_version == 0x80030000)
         cpu_add_l2_cache();
 
