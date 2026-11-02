@@ -7,7 +7,7 @@ kernel, drivers, Finder and applications), in a window or full screen on a curre
 translated to ARM64 and runs on the Mac's CPU cores under Hypervisor.framework; Tiger's own ATI driver drives an
 emulated Radeon 9700 whose 2D and 3D work runs on the Mac's GPU through Metal.
 
-**1.0 beta 1.** A hobby project, made for fun. Expect rough edges: most applications and games have never been tried.
+**1.0 beta 2.** A hobby project, made for fun. Expect rough edges: most applications and games have never been tried.
 [Download it](#download) or [build it](#building).
 
 ## Emulated, translated, native
@@ -45,7 +45,7 @@ and the graphics card:
   Apple's software renderer on the emulated processor. In Ptolemy, Tiger's ATI driver accelerates Quartz Extreme,
   Core Image and OpenGL on the Mac's GPU.
 
-On a MacBook Air with the M4, Tiger in Ptolemy scores about 4400 in Geekbench 2.2 (a Power Mac G5 at 1.6 GHz scores
+On a MacBook Air with the M4, Tiger in Ptolemy scores about 4500 in Geekbench 2.2 (a Power Mac G5 at 1.6 GHz scores
 1000), runs Halo's built-in time demo at about 90 fps with 2× FSAA and reaches its desktop about 10 seconds after the
 machine starts.
 Published Geekbench 2.2 results for Tiger in [QEMU 7.0 on an M1 Mac mini](https://browser.geekbench.com/geekbench2/2730728)
@@ -54,6 +54,9 @@ are older, so the comparison is approximate.
 
 QEMU runs on almost any computer and starts many more systems: Mac OS 9, other versions of Mac OS X, Linux. Ptolemy
 needs a Mac with Apple silicon and so far runs Tiger only.
+
+[ppcosxkvm](https://github.com/linuxkid473/ppcosxkvm), a QEMU fork, also emulates the Radeon 9700 for Tiger's ATI
+driver, starts Jaguar and Leopard as well and runs on Linux and Intel computers too. We recommend trying it as well.
 
 ## Graphics on Metal
 
@@ -90,10 +93,11 @@ The firmware is the only third-party code in the machine; everything else was wr
 
 ## Download
 
-`Ptolemy-1.0b1.zip` on the [Releases](https://github.com/dadanobel/ptolemy/releases) page holds Ptolemy.app with the
+`Ptolemy-1.0b2.zip` on the [Releases](https://github.com/dadanobel/ptolemy/releases) page holds Ptolemy.app with the
 engine, the firmware and Ptolemy Tools. You need:
 
-- A Mac with Apple silicon and macOS 26 or later.
+- A Mac with Apple silicon and macOS 15 Sequoia or later (tried on macOS 15 with an M1 Max and on macOS 27 with
+  an M4).
 - An image of your own Mac OS X Tiger 10.4 PowerPC install DVD (see below). Ptolemy does not include or download
   Apple software.
 
@@ -123,8 +127,8 @@ Ptolemy takes the resulting `.cdr` file, as well as `.dmg` and `.iso` images.
 ## What has been tried
 
 On a 13.6-inch MacBook Air with the M4 (10-core CPU and GPU, 24 GB), macOS 27, with Tiger 10.4.11 on the G4 7447A.
-Halo was measured with this release, Doom 3 with an earlier build of the same day, the others with builds of the weeks
-before it.
+Classic was tried with this release; SimCity 4, Cinebench, Geekbench and Xbench with development builds of it, Halo
+with beta 1, Doom 3 with a build of the same day as beta 1, the others with builds of the weeks before.
 
 | Software | Result |
 |---|---|
@@ -132,11 +136,12 @@ before it.
 | Halo (Universal) | Campaign plays. Built-in time demo at 800 × 600 with 2× FSAA and lens flares: 87–95 fps (two runs) |
 | Doom 3 1.3.1 | Renders completely (ARB2 path). `timedemo demo1` at 640 × 480: 55 fps |
 | Half-Life (Xash3D) | 1024 × 768: 430–650 fps, depending on the run |
-| SimCity 4 | Starts from its disc image; the tutorial city renders |
+| SimCity 4 | Starts from its disc image; tutorial cities render with their trees and buildings |
 | Fallout 2 | 640 × 480 in 256 colours |
-| Cinebench R10 | CPU 2773, OpenGL 5665 |
-| Geekbench 2.2 | 4381–4447 |
-| Xbench 1.3 | Runs |
+| Classic (Mac OS 9.2.2) | Starts in Tiger (15 starts in a row while testing beta 2); Age of Empires plays |
+| Cinebench R10 | CPU 2880, OpenGL 5700 |
+| Geekbench 2.2 | 4561 |
+| Xbench 1.3 | 263.82 |
 
 Everything else is untested. Reports are welcome.
 
@@ -147,11 +152,14 @@ Everything else is untested. Reports are welcome.
   4 samples) and its exact sample positions. See [docs/graphics.md](docs/graphics.md).
 - **Sleep.** When Tiger goes to sleep, the machine stops. Set Energy Saver to never put the computer to sleep.
 - **NVRAM.** Settings that Mac OS X keeps in NVRAM (for example Startup Disk) are not saved.
-- **Classic.** The Mac OS 9 environment does not start, and the firmware cannot start a disk that Tiger marked for
-  Mac OS 9.
+- **Classic.** Classic (Mac OS 9 inside Tiger) needs a Mac OS 9.2.2 System Folder that you bring into Tiger yourself,
+  in a disk image or a StuffIt archive (files dropped one by one lose their resource forks); Ptolemy does not include
+  one. The first start takes about two minutes. As on real Macs, Classic has no 3D. Mac OS 9 itself does not start:
+  the firmware cannot start a disk that Tiger marked for Mac OS 9.
 - **Files.** Files dropped onto the window arrive without resource forks, type and creator.
 - **Not available:** more than one CPU, CD audio, game controllers, sound input, incoming network connections.
-- **Mouse in games.** A captured mouse can feel fast; lower the game's own mouse sensitivity.
+- **Mouse in games.** When a game switches the display mode, Ptolemy captures the mouse: Ctrl+Option or Cmd+Tab
+  releases it, a click captures it again. A captured mouse can feel fast; lower the game's own mouse sensitivity.
 
 ## Plans
 
