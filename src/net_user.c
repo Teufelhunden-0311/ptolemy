@@ -18,7 +18,7 @@ enum {FLOWS=32,TCPS=64,RING=65536,RTO=300,TFIN=1,TSYN=2,TRST=4,TPSH=8,TACK=16};
 #define GUEST 0x0a4d000fu
 static const uint8_t router[6]={2,0x50,0x54,0,0,2};
 typedef struct {unsigned n;uint8_t data[PT_NET_FRAME];} Frame;
-typedef struct {int fd;uint8_t proto;uint16_t sport,dport;uint32_t remote;uint64_t used;} Flow;
+typedef struct {int fd;uint8_t proto;uint16_t sport,dport;uint32_t remote;uint64_t used,order;} Flow;   /* order: last use, in sends */
 /* Guest-initiated TCP. state: 0 free, 1 host connect pending, 2 SYN-ACK sent, 3 open. ring[i] holds host bytes
  * [una,top) indexed by sequence number, nxt is the next to send. fin: 1 guest FIN relayed, 2 host EOF (our FIN is top). */
 typedef struct {int fd;unsigned state,fin,dups;uint16_t sport,dport,wnd,mss;uint32_t remote,una,nxt,top,ack,recover;uint64_t used,timer;} Tcp;
@@ -26,6 +26,7 @@ struct PtUserNet {
     pthread_mutex_t lock;pthread_t worker;_Atomic int stop;int pipe[2];
     unsigned tw,tr,rw,rr;Frame tx[PT_NET_QUEUE],rx[PT_NET_QUEUE];Flow flow[FLOWS];Tcp tcp[TCPS];
     PtEvent *wake;_Atomic uint32_t *kick;_Atomic uint16_t web;uint8_t mac[6];uint32_t dns;uint16_t identification;uint8_t ring[TCPS][RING];
+    unsigned long evicted;uint64_t sends;   /* UDP/echo flows closed early to make room; datagrams sent */
 };
 static uint16_t u16(const uint8_t *p){return (uint16_t)p[0]<<8|p[1];}
 static uint32_t u32(const uint8_t *p){return (uint32_t)u16(p)<<16|u16(p+2);}
@@ -117,9 +118,12 @@ static void packet(PtUserNet *h,const uint8_t *b,unsigned n){
     uint16_t sport=u16(udp+(proto==1?4:0)),dport=proto==1?0:u16(udp+2);if(bytes>1480||(proto==1?udp[0]!=8||udp[1]:!sport||!dport))return;
     uint64_t now=ms();Flow *slot=NULL;for(unsigned i=0;i<FLOWS;i++){Flow *f=&h->flow[i];if(f->fd>=0&&now-f->used>30000){close(f->fd);f->fd=-1;}
         if(f->fd>=0&&f->proto==proto&&f->sport==sport&&f->dport==dport&&f->remote==destination){slot=f;break;}}
-    if(!slot)for(unsigned i=0;i<FLOWS;i++)if(h->flow[i].fd<0){slot=&h->flow[i];break;}if(!slot)return;
+    if(!slot)for(unsigned i=0;i<FLOWS;i++)if(h->flow[i].fd<0){slot=&h->flow[i];break;}
+    /* Full: the least recently used flow makes room. Every guest DNS query is a flow of its own (a new source port) for
+     * 30 s; dropping the datagram instead stalled the guest's resolver and with it lookupd, automount and the Finder. */
+    if(!slot){slot=&h->flow[0];for(unsigned i=1;i<FLOWS;i++)if(h->flow[i].order<slot->order)slot=&h->flow[i];close(slot->fd);slot->fd=-1;h->evicted++;}
     if(slot->fd<0){if((slot->fd=sock(SOCK_DGRAM,proto==1?IPPROTO_ICMP:0,destination,dport))<0)return;slot->proto=proto;slot->sport=sport;slot->dport=dport;slot->remote=destination;}
-    slot->used=now;(void)send(slot->fd,udp+(proto==1?0:8),bytes-(proto==1?0:8),0);
+    slot->used=now;slot->order=++h->sends;(void)send(slot->fd,udp+(proto==1?0:8),bytes-(proto==1?0:8),0);
 }
 /* Unprivileged echo sockets: macOS prepends the IP header and shows every reply from the peer, Linux rewrites the identifier. */
 static void flow_input(PtUserNet *h,Flow *f){uint8_t b[1541],q[1514]={0};ssize_t n=recv(f->fd,b,sizeof b,0);
@@ -163,6 +167,7 @@ PtUserNet *pt_user_net_open(PtEvent *wake,_Atomic uint32_t *kick,uint8_t mac[6],
     int rc=pthread_create(&h->worker,NULL,worker,h);if(rc){close(h->pipe[0]);close(h->pipe[1]);pthread_mutex_destroy(&h->lock);free(h);if(error)*error=rc;return NULL;}memcpy(mac,h->mac,6);if(error)*error=0;return h;
 }
 void pt_user_net_close(PtUserNet *h){if(!h)return;atomic_store(&h->stop,1);uint8_t b=1;(void)!write(h->pipe[1],&b,1);pthread_join(h->worker,NULL);
+    if(h->evicted)fprintf(stderr,"network: %lu UDP flows closed early to make room for new ones\n",h->evicted);
     for(unsigned i=0;i<FLOWS;i++)if(h->flow[i].fd>=0)close(h->flow[i].fd);for(unsigned i=0;i<TCPS;i++)if(h->tcp[i].state)close(h->tcp[i].fd);
     close(h->pipe[0]);close(h->pipe[1]);pthread_mutex_destroy(&h->lock);free(h);
 }

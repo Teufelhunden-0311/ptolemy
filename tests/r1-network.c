@@ -28,5 +28,12 @@ int main(void){
         packet(h,syn,sizeof syn);assert(h->tcp[0].state==1&&h->tcp[0].remote==0x0a010203);
         struct pollfd p={l,POLLIN,0};assert(poll(&p,1,2000)==1);int c=accept(l,NULL,NULL);assert(c>=0);close(c);close(h->tcp[0].fd);close(l);
     }
-    pthread_mutex_destroy(&h->lock);free(h);puts("PASS: rootless ARP/DHCP, loopback TCP refused, port 80 to the web gateway, lease options, NAK, IPv4/UDP checksums, malformed lengths and bounded frame parsing; no host network used");
+    {   /* more UDP flows than the table holds (a resolver's queries, each from a new port): the least recently used makes room */
+        uint8_t q[60]={0};memcpy(q+6,mac,6);w16(q+12,0x800);uint8_t *qi=q+14,*qu=qi+20;qi[0]=0x45;w16(qi+2,46);qi[8]=64;qi[9]=17;w32(qi+12,GUEST);w32(qi+16,0x7f000001);w16(qi+10,sum(qi,20,0));
+        for(unsigned i=0;i<FLOWS+8;i++){w16(qu,1024+i);w16(qu+2,53);w16(qu+4,26);qu[6]=qu[7]=0;packet(h,q,sizeof q);
+            unsigned found=0;for(unsigned k=0;k<FLOWS;k++)found+=h->flow[k].fd>=0&&h->flow[k].sport==1024+i;assert(found==1);}
+        assert(h->evicted==8);unsigned oldest=0;for(unsigned k=0;k<FLOWS;k++)oldest+=h->flow[k].fd>=0&&h->flow[k].sport<1024+8;assert(!oldest);
+        for(unsigned k=0;k<FLOWS;k++)if(h->flow[k].fd>=0){close(h->flow[k].fd);h->flow[k].fd=-1;}
+    }
+    pthread_mutex_destroy(&h->lock);free(h);puts("PASS: rootless ARP/DHCP, loopback TCP refused, port 80 to the web gateway, a full UDP flow table makes room, lease options, NAK, IPv4/UDP checksums, malformed lengths and bounded frame parsing; no host network used");
 }

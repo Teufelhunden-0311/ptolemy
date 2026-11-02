@@ -73,7 +73,7 @@ static void fuzz(uint16_t closed){
         for(unsigned k=0;k<TCPS;k++)if(z->tcp[k].state){assert(z->tcp[k].state==1&&z->tcp[k].mss>=1&&z->tcp[k].mss<=1460);close(z->tcp[k].fd);z->tcp[k].state=0;}
         z->rr=z->rw;}
     /* Echo replies as each host delivers them: Linux bare with its own identifier, macOS behind an IP header. */
-    int pair[2];assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,pair));Flow *f=&z->flow[0];*f=(Flow){pair[0],1,0x1234,0,0x08080808,0};
+    int pair[2];assert(!socketpair(AF_UNIX,SOCK_DGRAM,0,pair));Flow *f=&z->flow[0];*f=(Flow){pair[0],1,0x1234,0,0x08080808,0,0};
     uint8_t m[48]={0,0,0,0,0x99,0x99,0,7},macos[20+sizeof m]={0x45};memcpy(macos+20,m,sizeof m);w16(macos+24,0x1234);
     unsigned before=z->rw;assert(send(pair[1],m,sizeof m,0)==sizeof m);flow_input(z,f);assert(z->rw==before+1);
     uint8_t *r=z->rx[before%PT_NET_QUEUE].data;assert(z->rx[before%PT_NET_QUEUE].n==34+sizeof m&&r[23]==1&&u32(r+26)==0x08080808&&u32(r+30)==GUEST&&!sum(r+14,20,0)&&!r[34]&&u16(r+38)==0x1234&&u16(r+40)==7&&!sum(r+34,sizeof m,0));
