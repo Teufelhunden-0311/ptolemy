@@ -55,7 +55,7 @@ PT_PRODUCT_ENGINE=build/ptolemy-engine PT_PRODUCT_ROM=ROM PT_PRODUCT_TOOLS=Ptole
 ```
 
 The app is `build/Ptolemy.app`, signed ad hoc. Without the three inputs it builds an app that cannot start a machine.
-It needs macOS 26 or later.
+It needs macOS 15 Sequoia or later.
 
 ## Tests
 

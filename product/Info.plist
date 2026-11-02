@@ -8,7 +8,7 @@
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleShortVersionString</key><string>1.0b1</string>
 <key>CFBundleVersion</key><string>1.0b1</string>
-<key>LSMinimumSystemVersion</key><string>26.0</string>
+<key>LSMinimumSystemVersion</key><string>15.0</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>NSPrincipalClass</key><string>NSApplication</string>
 <key>NSRemovableVolumesUsageDescription</key><string>Ptolemy uses the Tiger installer you choose and your external media.</string>

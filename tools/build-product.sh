@@ -6,7 +6,7 @@ cd "$(dirname "$0")/.."
 # and codesign never meets a stale file's extended attributes.
 rm -rf build/Ptolemy.app
 mkdir -p build/product/modules build/Ptolemy.app/Contents/MacOS build/Ptolemy.app/Contents/Resources
-swiftc -swift-version 5 -target arm64-apple-macos26 -O -module-cache-path "$PWD/build/product/modules" product/InstallCore.swift product/Launcher.swift product/PtolemyApp.swift product/SelfTest.swift product/main.swift -framework AppKit -framework CryptoKit -framework IOKit -framework DiskArbitration -o build/Ptolemy.app/Contents/MacOS/Ptolemy
+swiftc -swift-version 5 -target arm64-apple-macos15 -O -module-cache-path "$PWD/build/product/modules" product/InstallCore.swift product/Launcher.swift product/PtolemyApp.swift product/SelfTest.swift product/main.swift -framework AppKit -framework CryptoKit -framework IOKit -framework DiskArbitration -o build/Ptolemy.app/Contents/MacOS/Ptolemy
 cp product/Info.plist build/Ptolemy.app/Contents/Info.plist
 icons=assets; [ -d "$icons" ] || icons=../../assets   # the icon and launcher art: assets/ in the repository
 if test -f "$icons/app-icon-macos-1024.png";then

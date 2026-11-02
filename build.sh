@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 set -eu
 cd "$(dirname "$0")"
+export MACOSX_DEPLOYMENT_TARGET=${MACOSX_DEPLOYMENT_TARGET:-15.0}   # the oldest macOS Ptolemy runs on (also build-optics.sh)
 E=${E:-./epicycle}   # G4-capable isolated engine; do not point at an unpatched G3 engine
 mkdir -p build
 case "${1-}" in ""|--test) ;; *) echo "Usage: $0 [--test]" >&2; exit 2;; esac
