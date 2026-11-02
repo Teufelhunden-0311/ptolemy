@@ -140,7 +140,8 @@ static NSCursor *blank_cursor(void){
     return NSPointInRect(p,self.bounds) && NSPointInRect(p,image);
 }
 - (BOOL)tryAutomaticCapture {
-    if(!_inputPolicyEnabled || !_autoEnabled || _captured || _autoBlocked || !(_agentCursorKnown || _sawGuestCursor) || ![self cursorHidden] ||
+    if(!_inputPolicyEnabled || !_autoEnabled || _captured || _autoBlocked ||
+       (!_gameMode && (!(_agentCursorKnown || _sawGuestCursor) || ![self cursorHidden])) ||
        _pointerSuspended || _menuTracking || !NSApp.isActive || !self.window.isKeyWindow ||
        NSWorkspace.sharedWorkspace.isVoiceOverEnabled ||
        self.window.attachedSheet || NSApp.modalWindow || self.window.firstResponder!=self || ![self pointerInsideImage])return NO;
@@ -264,8 +265,15 @@ static NSCursor *blank_cursor(void){
 - (void)applyCursorPolicy {
     [self.window invalidateCursorRectsForView:self];
     if(!_inputPolicyEnabled)return;
-    if(![self cursorHidden]){if(_automaticCapture)[self setRelativeCapture:NO];}
+    if(![self cursorHidden]){if(_automaticCapture && !_gameMode)[self setRelativeCapture:NO];}
     else [self tryAutomaticCapture];
+}
+/* A game's display mode: capture now (a release in it is the user's: Ctrl+Option, Cmd+Tab; a click captures again). */
+- (void)setGameMode:(BOOL)on {
+    if(_gameMode==on)return;
+    _gameMode=on;
+    if(on){_autoBlocked=NO;[self tryAutomaticCapture];}
+    else if(_automaticCapture)[self setRelativeCapture:NO];
 }
 - (void)observeGuestCursor:(unsigned)state {
     if(!_modernPointer)return;
@@ -273,7 +281,7 @@ static NSCursor *blank_cursor(void){
     if(_agentCursorKnown==known&&_agentCursorHidden==hidden)return;
     BOOL expired=_agentCursorKnown&&!known;
     _agentCursorKnown=known;_agentCursorHidden=hidden;
-    if(expired&&_automaticCapture)[self setRelativeCapture:NO];
+    if(expired&&_automaticCapture&&!_gameMode)[self setRelativeCapture:NO];
     [self applyCursorPolicy];
 }
 - (BOOL)captureSuggested {return _inputPolicyEnabled && _agentCursorKnown && _agentCursorHidden && !_captured && !_pointerSuspended;}

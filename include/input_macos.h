@@ -32,6 +32,10 @@
 @property(nonatomic) BOOL guestCursorHidden;
 /* Tools' authenticated Quartz observation: 0 unknown/expired, 1 visible, 2 hidden. */
 - (void)observeGuestCursor:(unsigned)state;
+/* The guest display is in a game's mode (not the desktop's geometry at 32 bits): the mouse is captured with no guess
+ * about the guest cursor; Ctrl+Option (or Cmd+Tab) releases it, a click on the image captures it again, and the
+ * desktop's mode back releases it. Set by the presenter, main thread. */
+@property(nonatomic) BOOL gameMode;
 /* Once per presenter frame: host cursor and Tiger's position after the pointer returns from the Mac menu bar or Dock. */
 - (void)pollPointer;
 - (void)observeGuestPointerX:(int)x y:(int)y width:(unsigned)width height:(unsigned)height at:(uint64_t)at;

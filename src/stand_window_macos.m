@@ -304,7 +304,7 @@ static dispatch_queue_t clip_queue;static NSInteger clip_seen=-1;static NSString
 @implementation PTStandPresenter {
     id<MTLDevice> _dev; id<MTLCommandQueue> _queue; id<MTLRenderPipelineState> _pipe,_pipeTexture;
     PTDisplayView *_view; PTStandActions *_actions;
-    id<MTLCommandBuffer> _last; BOOL _gameModes;
+    id<MTLCommandBuffer> _last; BOOL _gameModes, _gameSeen; CFTimeInterval _gameSince; unsigned _desktopW,_desktopH;
     id<MTLBuffer> _cursor; uint32_t _cursorGen,_cursorW,_cursorH,_gammaGen,_gamma[256]; BOOL _gammaOn;
 }
 - (instancetype)initWithView:(PTDisplayView *)view actions:(PTStandActions *)actions {
@@ -335,6 +335,12 @@ static dispatch_queue_t clip_queue;static NSInteger clip_seen=-1;static NSString
     if(!card || !pt_radeon_frame_acquire(card,&rf))return;
     const BOOL leased=YES;
     const struct { int enabled; unsigned width,height,bpp,line,start; int big_endian; } m={1,rf.width,rf.height,rf.bpp,rf.line,0,rf.big_endian};
+    {   /* a game's display mode (not the desktop's geometry at 32 bits) held for a second: the view captures the mouse */
+        if(!_desktopW){const PtBootMode *bm=pt_boot_mode(getenv("PT_EDID_MODE"));_desktopW=bm?bm->width:1024;_desktopH=bm?bm->height:768;}
+        BOOL game=rf.bpp!=32 || rf.width!=_desktopW || rf.height!=_desktopH;CFTimeInterval now=CACurrentMediaTime();
+        if(game!=_gameSeen){_gameSeen=game;_gameSince=now;}
+        else if(now-_gameSince>=1.0 && _view.gameMode!=game)_view.gameMode=game;
+    }
     id<CAMetalDrawable> drawable=[_view.metalLayer nextDrawable]; if (!drawable) {if(leased)pt_radeon_frame_release(card,&rf);return;}
     CGSize ds=_view.metalLayer.drawableSize;
     Params p={0};
@@ -404,8 +410,8 @@ int pt_stand_window_main(PtStandWindow *w) {
          * other explicit mode wins. No mode switch when a running window changes monitor. */
         [NSApplication sharedApplication];NSScreen *screen=[NSScreen mainScreen];
         /* PT_EDID_MODE=screen: the guest mode is this screen's full-screen content size in points (below the
-         * camera housing), width rounded to the nearest 64 pixels: Tiger's compositor blits with a 64-pixel
-         * aligned pitch, and a CRTC pitch that differs (e.g. 1464) leaves small sheared sprites on screen.
+         * camera housing), width rounded to the nearest 64 pixels: Tiger's compositor blits with rows of whole
+         * 256 bytes (64 pixels at 32 bits), and a CRTC pitch that differs (e.g. 1464) leaves small sheared sprites.
          * The presenter fills the rest in full screen. */
         const char *wanted=getenv("PT_EDID_MODE");BOOL classic=wanted && !strcmp(wanted,"1024x768");
         if(classic)unsetenv("PT_EDID_MODE");
