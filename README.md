@@ -145,6 +145,18 @@ with beta 1, Doom 3 with a build of the same day as beta 1, the others with buil
 
 Everything else is untested. Reports are welcome.
 
+## Classic Environment
+
+You can download a Mac OS 9.2.2 System Folder for Mac OS X Tiger from the Internet (for example, the “Classic folder” archive from Macintosh Repository) and install it:
+
+1. Unpack the archive on your Mac with The Unarchiver or StuffIt Expander. They keep the files’ resource forks, which Mac OS 9 needs.
+2. In Finder, Control-click the unpacked folder and choose Compress. Finder’s zip keeps the resource forks.
+3. In Ptolemy, choose Media › Insert Disk Image… and select the zip. Tiger shows it as a disk with the zip’s name.
+4. In Tiger, drag the System Folder from that disk onto Tiger’s disk.
+5. Open System Preferences › Classic, select that System Folder and click Start.
+
+Don’t drag Mac OS 9 files onto Ptolemy’s window: that copy loses their resource forks.
+
 ## Known limitations
 
 - **Graphics.** Every case of the OpenGL comparison test matches Apple's software renderer, but some details are
