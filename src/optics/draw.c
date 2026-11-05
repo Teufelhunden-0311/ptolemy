@@ -600,8 +600,16 @@ static int draw_build(OpticsDraw *d,const uint32_t *reg,const struct OpticsR300S
     if(pt_r2_shader_check_interface(d->pvs,&d->vi,&e)!=PT_R2_SHADER_OK) return refuse(reason,"PVS program does not fit the VAP interface");
     if(pt_r2_shader_check_interface(d->us,&d->fi,&e)!=PT_R2_SHADER_OK) return refuse(reason,"US program does not fit the RS interface");
     /* Constants */
+    /* VAP_PVS_CONST_CNTL (0x22d4) PVS_CONST_BASE_OFFSET 7:0: "Vector Offset into PVS constant memory to the start of the
+     * constants for the current shader" (AMD R3xx 3D Register Reference, rev 1.0, p. 79). Leopard's ATI driver runs its
+     * vertex programs from a second bank (PVS_FIRST_INST 128) with constants at base 128; Tiger's leaves it 0. Read without
+     * it, Leopard's position matrix came from bank 0 and every window, icon and Dock tile was squashed to a few rows.
+     * Not modelled: PVS_MAX_CONST_ADDR 23:16 (out-of-range constant reads return 0,0,0,0). OPTICS_PVS_CONST_BASE=0 ignores
+     * the offset (A/B). AI-generated (Claude), 2026-11-04. */
+    static int const_base=-1; if(const_base<0){ const char *v=getenv("OPTICS_PVS_CONST_BASE"); const_base=!v||atoi(v)!=0; }
+    unsigned base=const_base?(R(0x22d4)&0xffu):0;
     for(unsigned i=0;i<(pvs_constants?pvs_constants:1);i++) {
-        uint32_t w[4]={0}; if(optics_r300_pvs_vector(st,512+i,w)!=OPTICS_STATE_OK) memset(w,0,sizeof w);
+        uint32_t w[4]={0}; if(optics_r300_pvs_vector(st,512+base+i,w)!=OPTICS_STATE_OK) memset(w,0,sizeof w);
         for(int c=0;c<4;c++) d->pvs_constant[i][c]=f32(w[c]);
     }
     for(unsigned i=0;i<32;i++) for(int c=0;c<4;c++) d->us_constant[i][c]=f24(R(US_ALU_CONST_0+16*i+4*c));
