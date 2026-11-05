@@ -41,6 +41,7 @@ try:
  test('optics-colour-formats')
  test('optics-lines-blend')
  test('optics-pvs-math',cpp=True)
+ test('optics-pvs-const-base',None,{'OPTICS_PVS_CONST_BASE':'0'})
  test('optics-depth-growth',{'OPTICS_DEPTH_CAPACITY':'1'},{'OPTICS_DEPTH_CAPACITY':'0'})
  test('optics-depth-io',{'OPTICS_DEPTH_IO':'2'},{'OPTICS_DEPTH_IO':'0'})
  # The complete depth contract also runs with FIFO Metal ownership enabled; then the product's on-demand export.
